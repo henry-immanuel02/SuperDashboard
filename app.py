@@ -11,10 +11,10 @@ import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether, HRFlowable
 
 st.set_page_config(page_title="SuperDashboard", page_icon="🎫", layout="wide")
 TZ = ZoneInfo("Asia/Jakarta")
@@ -45,7 +45,7 @@ AUDIT_HEADERS = ["timestamp", "ticket_id", "action", "username", "from_status", 
 CUSTOM_CSS = """
 <style>
 :root { --ink:#14273f; --muted:#66788e; --line:#e5ebf2; --accent:#1557a0; }
-.block-container { max-width: 1460px; padding-top: 1.35rem; padding-bottom: 2rem; }
+.block-container { max-width: 1480px; padding-top: 5.4rem !important; padding-bottom: 2.5rem; }
 h1 { font-size: 1.7rem !important; letter-spacing: -.035em; font-weight: 730 !important; color:var(--ink) !important; }
 h2, h3 { letter-spacing: -.015em; color: var(--ink) !important; }
 h3 { font-size:1.1rem !important; margin-top:.35rem !important; }
@@ -56,7 +56,16 @@ h3 { font-size:1.1rem !important; margin-top:.35rem !important; }
 [data-testid="stMetricLabel"] { color:var(--muted); }
 [data-testid="stMetricValue"] { color:var(--ink); font-size:1.65rem; }
 [data-testid="stForm"] { padding: 1.15rem 1.2rem; border:1px solid var(--line); border-radius:12px; background: #fff; }
-[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+[data-testid="stDataFrame"] { border:1px solid #dce5f0; border-radius:14px; overflow:hidden; box-shadow:0 7px 24px rgba(20,46,79,.055); }
+[data-testid="stDataFrame"] [role="columnheader"] { background:#edf3fa !important; color:#193956 !important; font-weight:700 !important; }
+[data-testid="stDataFrame"] [role="row"] { cursor:pointer; }
+[data-testid="stDataFrame"] [role="row"]:hover { background:#edf5ff !important; }
+[data-testid="stDataFrame"] [aria-selected="true"] { background:#dcecff !important; }
+[data-testid="stDataFrame"] [data-testid="stElementToolbar"] { display:none; }
+[data-testid="stDownloadButton"] button { background:#1463bf !important; border:1px solid #1463bf !important; color:#fff !important; font-weight:650 !important; border-radius:9px !important; }
+[data-testid="stDownloadButton"] button:hover { background:#0f4e99 !important; border-color:#0f4e99 !important; color:white !important; }
+.st-key-ticket_preview { border:1px solid var(--line); border-radius:12px; }
+
 [data-testid="stTabs"] button { font-weight:600; }
 .stButton>button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] { background:#1557a0; border-color:#1557a0; }
 [data-testid="stVerticalBlock"] { gap:.66rem; }
@@ -66,6 +75,8 @@ h3 { font-size:1.1rem !important; margin-top:.35rem !important; }
 .actuarial-value { font-size:25px; font-weight:700; margin-top:3px; color:#1c436c; }
 .actuarial-note { font-size:11px; color:#7c8b9b; margin-top:3px; }
 .tagline { font-size:13px; font-weight:750; letter-spacing:.07em; color:#1f639e; margin:-5px 0 12px; }
+[data-testid="stAppViewContainer"] { background:#f8fafc; }
+[data-testid="stHeader"] { background:transparent; }
 </style>
 """
 
@@ -162,68 +173,80 @@ def open_ticket(ticket_id):
 
 
 def page_back():
+    st.session_state.table_nonce = st.session_state.get("table_nonce", 0) + 1
     st.session_state.selected_ticket = None
     st.rerun()
 
 
 def show_table(rows, key, empty_message="Belum ada tiket."):
-    """Client-side search/pagination; render only current page and defer PDFs until opened."""
+    """Compact, selectable, paginated native Streamlit table; no external ticket buttons."""
     if not rows:
-        st.info(empty_message)
+        st.caption(empty_message)
         return
-    search_col, page_size_col = st.columns([4, 1.2], vertical_alignment="bottom")
+    search_col, page_size_col = st.columns([5, 1], vertical_alignment="bottom")
     with search_col:
         query = st.text_input(
-            "Search ticket / insured name", key=f"{key}_search",
-            placeholder="Cari nomor tiket atau insured name...",
+            "Cari tiket", key=f"{key}_search",
+            placeholder="Search ticket number or insured name...",
             label_visibility="collapsed",
         ).strip().casefold()
     with page_size_col:
         page_size = st.selectbox("Rows", [10, 20, 50], index=0, key=f"{key}_size", label_visibility="collapsed")
+
     filtered = [x for x in rows if not query or query in str(x['ticket_id']).casefold() or query in str(x['insured_name']).casefold()]
     filtered.sort(key=lambda x: int(x['ticket_id']) if str(x['ticket_id']).isdigit() else 0, reverse=True)
     n = len(filtered)
     total_pages = max(1, (n + page_size - 1) // page_size)
     page_key = f"{key}_page"
-    filter_key = f"{key}_filter_signature"
     signature = (query, page_size)
-    if st.session_state.get(filter_key) != signature:
+    if st.session_state.get(f"{key}_signature") != signature:
         st.session_state[page_key] = 1
-        st.session_state[filter_key] = signature
+        st.session_state[f"{key}_signature"] = signature
     current_page = min(max(1, int(st.session_state.get(page_key, 1))), total_pages)
     st.session_state[page_key] = current_page
     left = (current_page - 1) * page_size
     page_rows = filtered[left:left + page_size]
     if not page_rows:
-        st.info("Tidak ada tiket yang cocok dengan pencarian.")
+        st.caption("No matching tickets.")
         return
-    # Only current page is rendered; no duplicate full-length list of buttons.
+
     data = pd.DataFrame([{
-        "Ticket #": f"#{x['ticket_id']}",
+        "Ticket No.": f"#{x['ticket_id']}",
         "Insured Name": x['insured_name'] or "—",
         "Class": x['class_of_business'] or "—",
         "Status": x['status'],
-        "Last Update": x['updated_at'],
+        "Last Updated": x['updated_at'],
     } for x in page_rows])
-    st.dataframe(data, hide_index=True, use_container_width=True, height=min(39 + len(page_rows) * 35, 435))
-    st.caption("Pilih nomor tiket untuk melihat detail dan PDF. PDF hanya dibuat saat tiket dibuka.")
-    with st.container():
-        cols = st.columns(5)
-        for i, rec in enumerate(page_rows):
-            with cols[i % 5]:
-                if st.button(f"#{rec['ticket_id']}", key=f"{key}_open_{rec['ticket_id']}", use_container_width=True):
-                    open_ticket(rec['ticket_id'])
-    nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 2], vertical_alignment="center")
-    nav1.caption(f"Menampilkan {left + 1}–{left + len(page_rows)} dari {n} tiket")
+    table_event = st.dataframe(
+        data, hide_index=True, use_container_width=True,
+        height=min(42 + len(page_rows) * 36, 465),
+        on_select="rerun", selection_mode="single-row",
+        key=f"{key}_table_p{current_page}_q{abs(hash(signature))}_n{st.session_state.get('table_nonce', 0)}",
+        column_config={
+            "Ticket No.": st.column_config.TextColumn("TICKET", width="small"),
+            "Insured Name": st.column_config.TextColumn("INSURED NAME", width="large"),
+            "Class": st.column_config.TextColumn("CLASS", width="small"),
+            "Status": st.column_config.TextColumn("STATUS", width="medium"),
+            "Last Updated": st.column_config.TextColumn("LAST UPDATED", width="medium"),
+        },
+    )
+    selected_rows = table_event.selection.rows
+    if selected_rows:
+        selected_row = selected_rows[0]
+        if 0 <= selected_row < len(page_rows):
+            open_ticket(page_rows[selected_row]['ticket_id'])
+
+    nav1, nav2, nav3, nav4 = st.columns([3, 1, 1, 2], vertical_alignment="center")
+    nav1.caption(f"{n:,} tickets · {left + 1}–{left + len(page_rows)} shown")
     with nav2:
-        if st.button("← Prev", key=f"{key}_prev", disabled=current_page <= 1, use_container_width=True):
+        if st.button("Previous", key=f"{key}_prev", disabled=current_page <= 1, use_container_width=True):
             st.session_state[page_key] = current_page - 1
             st.rerun()
     with nav3:
-        if st.button("Next →", key=f"{key}_next", disabled=current_page >= total_pages, use_container_width=True):
+        if st.button("Next", key=f"{key}_next", disabled=current_page >= total_pages, use_container_width=True):
             st.session_state[page_key] = current_page + 1
             st.rerun()
-    nav4.caption(f"Page {current_page} / {total_pages}")
+    nav4.caption(f"Page {current_page} of {total_pages}")
 
 
 def safe(x):
@@ -231,63 +254,144 @@ def safe(x):
 
 
 def pdf_bytes(d):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=37, leftMargin=37, topMargin=37, bottomMargin=37)
+    """Premium A4 acceptance record with consistent hierarchy and page folios."""
+    buff = io.BytesIO()
+    navy = colors.HexColor("#102C49")
+    blue = colors.HexColor("#1760AE")
+    ink = colors.HexColor("#1C3249")
+    muted = colors.HexColor("#6C7F92")
+    border = colors.HexColor("#DDE6EF")
+    soft = colors.HexColor("#F3F7FB")
+    doc = SimpleDocTemplate(buff, pagesize=A4, leftMargin=43, rightMargin=43,
+                            topMargin=53, bottomMargin=52, title=f"SuperDashboard Ticket {d['ticket_id']}",
+                            author="SuperDashboard")
+    avail = A4[0] - 86
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="DashboardTitle", parent=styles["Heading1"], alignment=TA_CENTER, fontSize=17, spaceAfter=12))
-    styles.add(ParagraphStyle(name="DashboardBody", parent=styles["BodyText"], fontSize=9, leading=13))
-    styles.add(ParagraphStyle(name="DashboardSmall", parent=styles["BodyText"], fontSize=8, leading=11, textColor=colors.HexColor("#555555")))
-    story = [Paragraph("SUPERDASHBOARD — ACCEPTANCE TICKET", styles["DashboardTitle"]),
-             Paragraph("#BePaperless", styles["DashboardSmall"]), Spacer(1, 6),
-             Paragraph(f"Ticket #{safe(d['ticket_id'])} | Status: {safe(d['status'])}", styles["Heading2"]), Spacer(1, 9)]
-    def section(title, pairs):
-        story.append(Paragraph(safe(title), styles["Heading3"]))
-        data = [[Paragraph(safe(label), styles["DashboardBody"]), Paragraph(safe(value), styles["DashboardBody"])] for label, value in pairs]
-        tbl = Table(data, colWidths=[145, 367], hAlign="LEFT")
-        tbl.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 5), ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.lightgrey),
-            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F5F8")),
-        ]))
+    styles.add(ParagraphStyle(name="SD_Title", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=20, leading=25, textColor=navy, spaceAfter=3))
+    styles.add(ParagraphStyle(name="SD_Sub", parent=styles["Normal"], fontSize=9, leading=13,
+                              textColor=muted))
+    styles.add(ParagraphStyle(name="SD_H", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=10.5, leading=15, textColor=navy, spaceBefore=12, spaceAfter=7))
+    styles.add(ParagraphStyle(name="SD_Label", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=8, leading=12, textColor=muted))
+    styles.add(ParagraphStyle(name="SD_Value", parent=styles["Normal"], fontSize=9, leading=14,
+                              textColor=ink, wordWrap="CJK"))
+    styles.add(ParagraphStyle(name="SD_Value_Bold", parent=styles["SD_Value"], fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="SD_Muted", parent=styles["Normal"], fontSize=8, leading=12, textColor=muted))
+    styles.add(ParagraphStyle(name="SD_Metric", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=16, leading=20, textColor=navy))
+
+    def P(value, sty="SD_Value"):
+        return Paragraph(safe(value), styles[sty])
+
+    def pairs_section(title, pairs):
+        # One visual table per section, with alternating lightly colored rows.
+        story.append(Paragraph(safe(title.upper()), styles["SD_H"]))
+        content = []
+        for label, value in pairs:
+            content.append([P(label, "SD_Label"), P(value)])
+        tbl = Table(content, colWidths=[155, avail - 155], hAlign="LEFT")
+        ts = [
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("LINEBELOW", (0, 0), (-1, -2), .35, border),
+            ("BOX", (0, 0), (-1, -1), .6, border),
+            ("BACKGROUND", (0, 0), (0, -1), soft),
+        ]
+        tbl.setStyle(TableStyle(ts))
         story.append(tbl)
-        story.append(Spacer(1, 10))
-    section("Sales Support / Quotation", [
-        ("Source of Business", d["source_of_business"]), ("Marketing Name", d["marketing_name"]),
-        ("Class of Business", d["class_of_business"]),
-        ("Period of Insurance", f"{d['period_from']} to {d['period_to']}"),
-        ("Insured Name", d["insured_name"]), ("Occupation", d["occupation"]),
-        ("Risk Location", ", ".join(str(d[k]) for k in ["risk_detail", "city", "province", "country"] if d[k])),
+
+    story = []
+    # Executive masthead: disciplined whitespace with branded accent line.
+    top = Table([[P("SUPERDASHBOARD", "SD_Title"), P("#BePaperless", "SD_Muted")]],
+                colWidths=[avail * .73, avail * .27])
+    top.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "BOTTOM"),
+                             ("ALIGN", (1,0), (1,0), "RIGHT"),
+                             ("LEFTPADDING", (0,0), (-1,-1), 0),
+                             ("RIGHTPADDING", (0,0), (-1,-1), 0),
+                             ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+    story.append(top)
+    story.append(HRFlowable(width="100%", thickness=2.5, color=blue, spaceAfter=11))
+    story.append(P("ACCEPTANCE & QUOTATION RECORD", "SD_Sub"))
+    story.append(Spacer(1, 11))
+    headline = Table([
+        [P("TICKET NUMBER", "SD_Label"), P("CURRENT STATUS", "SD_Label"), P("LAST UPDATED", "SD_Label")],
+        [P(f"#{d['ticket_id']}", "SD_Value_Bold"), P(d['status'], "SD_Value_Bold"), P(d['updated_at'] or d['created_at'])],
+    ], colWidths=[avail *.23, avail *.32, avail *.45])
+    headline.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), soft),
+                                  ("BOX", (0,0), (-1,-1), .8, border),
+                                  ("TOPPADDING", (0,0), (-1,0), 9),
+                                  ("BOTTOMPADDING", (0,1), (-1,1), 10),
+                                  ("LEFTPADDING", (0,0), (-1,-1), 12),
+                                  ("RIGHTPADDING", (0,0), (-1,-1), 9)]))
+    story.append(headline)
+
+    pairs_section("01 / Business & Policy Details", [
+        ("Source of Business", d['source_of_business']), ("Marketing Name", d['marketing_name']),
+        ("Class of Business", d['class_of_business']),
+        ("Period of Insurance", f"{d['period_from']} — {d['period_to']}"),
+        ("Insured Name", d['insured_name']), ("Occupation", d['occupation']),
+        ("Risk Location", ", ".join(str(d[k]) for k in ['risk_detail', 'city', 'province', 'country'] if d[k])),
         ("Total Sum Insured", f"{d['currency']} {d['total_sum_insured']}"),
         ("Brokerage / RIC", f"{d['currency']} {d['brokerage_ric']}"),
-        ("Process to Reinsurance", "Yes" if d["process_reinsurance"] == "Yes" else "No"),
+        ("Reinsurance Required", "Yes" if d['process_reinsurance'] == 'Yes' else "No"),
     ])
-    section("Actuarial Insight", [
-        ("Loss Ratio", "Pending actuarial data"),
-        ("Combined Ratio", "Pending actuarial data"),
+
+    story.append(Paragraph("02 / ACTUARIAL INSIGHT", styles["SD_H"]))
+    metric = Table([
+        [P("LOSS RATIO", "SD_Label"), P("COMBINED RATIO", "SD_Label")],
+        [P("—", "SD_Metric"), P("—", "SD_Metric")],
+        [P("Awaiting actuarial data", "SD_Muted"), P("Awaiting actuarial data", "SD_Muted")],
+    ], colWidths=[avail/2, avail/2])
+    metric.setStyle(TableStyle([("BACKGROUND", (0,0),(-1,-1),soft),
+                               ("BOX", (0,0),(-1,-1),.7,border),
+                               ("LINEBEFORE", (1,0),(1,-1),.7,border),
+                               ("LEFTPADDING",(0,0),(-1,-1),12),
+                               ("TOPPADDING",(0,0),(-1,0),10),
+                               ("BOTTOMPADDING",(0,-1),(-1,-1),11)]))
+    story.append(metric)
+
+    pairs_section("03 / Marketing Information", [
+        ("Marketing Information", d['marketing_information']),
+        ("Filled by", f"{d['created_by']} at {d['sales_confirmed_at']}"),
+        ("Reviewed by Marketing", f"{d['marketing_reviewed_by']} at {d['marketing_reviewed_at']}" if d['marketing_reviewed_at'] else "Pending"),
     ])
-    section("Marketing Information", [
-        ("Marketing Information", d["marketing_information"]),
-        ("Filled by", f"{d['created_by']} at {d['sales_confirmed_at']}")
-    ])
-    section("Marketing Review", [
-        ("Reviewed by Marketing", f"{d['marketing_reviewed_by']} at {d['marketing_reviewed_at']}" if d["marketing_reviewed_at"] else "Pending")
-    ])
-    if d["process_reinsurance"] == "Yes":
-        section("Reinsurance", [
-            ("Reinsurance Information", d["reinsurance_information"]),
-            ("Reviewed by Reinsurance", f"{d['reinsurance_reviewed_by']} at {d['reinsurance_reviewed_at']}" if d["reinsurance_reviewed_at"] else "Pending")
+    if d['process_reinsurance'] == 'Yes':
+        pairs_section("04 / Reinsurance Review", [
+            ("Reinsurance Information", d['reinsurance_information']),
+            ("Reviewed by Reinsurance", f"{d['reinsurance_reviewed_by']} at {d['reinsurance_reviewed_at']}" if d['reinsurance_reviewed_at'] else "Pending"),
         ])
-    section("Underwriting", [
-        ("Final Decision", d["uw_status"]), ("Our Role", d["our_role"]),
-        ("Our Share (%)", d["our_share_pct"]), ("Underwriting Recommendation", d["underwriting_recommendation"]),
-        ("Own Retention (%)", d["own_retention_pct"]), ("Treaty QS (%)", d["qs_pct"]),
-        ("Treaty SPL (%)", d["spl_pct"]), ("Facultative (%)", d["facultative_pct"]),
-        ("Allocation Total (%)", d["allocation_total_pct"]),
-        ("Confirmed by", f"{d['uw_confirmed_by']} at {d['uw_confirmed_at']}" if d["uw_confirmed_at"] else "Pending")
+    pairs_section("05 / Underwriting Decision", [
+        ("Final Decision", d['uw_status']), ("Our Role", d['our_role']),
+        ("Our Share (%)", d['our_share_pct']),
+        ("Underwriting Recommendation", d['underwriting_recommendation']),
+        ("Own Retention (%)", d['own_retention_pct']),
+        ("Treaty QS (%)", d['qs_pct']), ("Treaty SPL (%)", d['spl_pct']),
+        ("Facultative (%)", d['facultative_pct']),
+        ("Allocation Total (%)", d['allocation_total_pct']),
+        ("Confirmed by", f"{d['uw_confirmed_by']} at {d['uw_confirmed_at']}" if d['uw_confirmed_at'] else "Pending"),
     ])
-    story.append(Paragraph(f"Generated at {now()} | Internal workflow record — not an insurance policy or binder.", styles["DashboardSmall"]))
-    doc.build(story)
-    return buffer.getvalue()
+    story.append(Spacer(1,14))
+    story.append(P("Internal workflow record. This document does not constitute a policy, cover note, or binder.", "SD_Muted"))
+
+    def page_footer(canvas, doc_obj):
+        canvas.saveState()
+        width, _ = A4
+        canvas.setStrokeColor(border)
+        canvas.setLineWidth(.6)
+        canvas.line(43, 40, width - 43, 40)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(muted)
+        canvas.drawString(43, 28, f"SuperDashboard  |  #{d['ticket_id']}  |  Generated {now()}")
+        canvas.drawRightString(width - 43, 28, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer)
+    return buff.getvalue()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -404,10 +508,8 @@ def detail_ticket(d, role, user):
     actuarial_insight()
     if st.toggle("Show PDF preview / download", value=False, key=f"pdf_{d['ticket_id']}"):
         pdf = pdf_bytes(d)
-        st.download_button("⬇ Download Ticket PDF", pdf, file_name=f"SuperDashboard_Ticket_{d['ticket_id']}.pdf", mime="application/pdf")
+        st.download_button("download pdf", pdf, file_name=f"SuperDashboard_Ticket_{d['ticket_id']}.pdf", mime="application/pdf", type="primary")
         st.pdf(pdf, height=560)
-    else:
-        st.caption("PDF loaded on demand to keep this page fast. Enable the preview above to view or download.")
     if role == "Admin":
         st.caption("Admin: read-only overview (no approval overrides in this MVP).")
         return
@@ -497,8 +599,6 @@ def detail_ticket(d, role, user):
             log_action(d["ticket_id"], "UW_FINAL", user, "Pending UW", decision, f"Allocation {total:.2f}%")
             st.success(f"Tiket selesai: {decision}")
             st.rerun()
-    else:
-        st.caption("Tidak ada tindakan yang tersedia untuk akun ini pada status saat ini.")
 
 
 def login():
@@ -603,7 +703,7 @@ def main():
             counts = pd.Series([x["status"] for x in all_tickets]).value_counts()
             st.bar_chart(counts)
         st.info("Full audit trail is stored in the AuditLog worksheet in Google Sheets.")
-    if st.button("🔄 Refresh Data"):
+    if st.button("Refresh", key="refresh_data"):
         invalidate_tickets()
         st.rerun()
 
