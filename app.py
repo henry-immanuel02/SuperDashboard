@@ -42,6 +42,48 @@ HEADERS = [
 AUDIT_HEADERS = ["timestamp", "ticket_id", "action", "username", "from_status", "to_status", "details"]
 
 
+CUSTOM_CSS = """
+<style>
+:root { --ink:#14273f; --muted:#66788e; --line:#e5ebf2; --accent:#1557a0; }
+.block-container { max-width: 1460px; padding-top: 1.35rem; padding-bottom: 2rem; }
+h1 { font-size: 1.7rem !important; letter-spacing: -.035em; font-weight: 730 !important; color:var(--ink) !important; }
+h2, h3 { letter-spacing: -.015em; color: var(--ink) !important; }
+h3 { font-size:1.1rem !important; margin-top:.35rem !important; }
+[data-testid="stSidebar"] { background: #10263f; }
+[data-testid="stSidebar"] * { color:#eef4fc !important; }
+[data-testid="stSidebar"] button { background:#1a3859 !important; border-color:#385675 !important; }
+[data-testid="stMetric"] { border:1px solid var(--line); background: #fff; padding: 13px 17px; border-radius: 12px; box-shadow:0 2px 10px rgba(19,46,82,.035); }
+[data-testid="stMetricLabel"] { color:var(--muted); }
+[data-testid="stMetricValue"] { color:var(--ink); font-size:1.65rem; }
+[data-testid="stForm"] { padding: 1.15rem 1.2rem; border:1px solid var(--line); border-radius:12px; background: #fff; }
+[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+[data-testid="stTabs"] button { font-weight:600; }
+.stButton>button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] { background:#1557a0; border-color:#1557a0; }
+[data-testid="stVerticalBlock"] { gap:.66rem; }
+[data-testid="stCaptionContainer"] { color:var(--muted); }
+.actuarial-card { border:1px solid #dce5f0; background:linear-gradient(120deg,#f6f9fe,#fff); padding:13px 17px; border-radius:12px; margin:2px 0 12px; }
+.actuarial-label { font-size:11px; font-weight:750; letter-spacing:.09em; color:#536982; }
+.actuarial-value { font-size:25px; font-weight:700; margin-top:3px; color:#1c436c; }
+.actuarial-note { font-size:11px; color:#7c8b9b; margin-top:3px; }
+.tagline { font-size:13px; font-weight:750; letter-spacing:.07em; color:#1f639e; margin:-5px 0 12px; }
+</style>
+"""
+
+
+def apply_theme():
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+def actuarial_insight():
+    """Display-only placeholders; no numbers are calculated yet."""
+    st.markdown("#### Actuarial Insight")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("<div class='actuarial-card'><div class='actuarial-label'>LOSS RATIO</div><div class='actuarial-value'>—</div><div class='actuarial-note'>Awaiting actuarial data</div></div>", unsafe_allow_html=True)
+    with right:
+        st.markdown("<div class='actuarial-card'><div class='actuarial-label'>COMBINED RATIO</div><div class='actuarial-value'>—</div><div class='actuarial-note'>Awaiting actuarial data</div></div>", unsafe_allow_html=True)
+
+
 def now():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S WIB")
 
@@ -77,6 +119,7 @@ def audit_ws():
     return get_worksheet("AuditLog", AUDIT_HEADERS)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def load_tickets():
     ws = ticket_ws()
     vals = ws.get_all_values()
@@ -92,6 +135,10 @@ def load_tickets():
     return out
 
 
+def invalidate_tickets():
+    load_tickets.clear()
+
+
 def log_action(ticket_id, action, user, old, new, details=""):
     audit_ws().append_row([now(), str(ticket_id), action, user, old, new, details], value_input_option="RAW")
 
@@ -100,11 +147,13 @@ def append_ticket(d):
     # A small-app MVP: max+1 is not atomic across simultaneous requests.
     values = [str(d.get(h, "")) for h in HEADERS]
     ticket_ws().append_row(values, value_input_option="RAW")
+    invalidate_tickets()
 
 
 def update_ticket(d):
     row = int(d["_row"])
     ticket_ws().update(range_name=f"A{row}:AM{row}", values=[[str(d.get(h, "")) for h in HEADERS]], value_input_option="RAW")
+    invalidate_tickets()
 
 
 def open_ticket(ticket_id):
@@ -118,22 +167,63 @@ def page_back():
 
 
 def show_table(rows, key, empty_message="Belum ada tiket."):
+    """Client-side search/pagination; render only current page and defer PDFs until opened."""
     if not rows:
         st.info(empty_message)
         return
-    view = pd.DataFrame([{
-        "Ticket": x["ticket_id"], "Insured": x["insured_name"], "Class": x["class_of_business"],
-        "Status": x["status"], "Updated": x["updated_at"]
-    } for x in sorted(rows, key=lambda x: int(x["ticket_id"]), reverse=True)])
-    st.dataframe(view, hide_index=True, use_container_width=True)
-    st.caption("Klik nomor tiket di bawah untuk membuka detail dan PDF.")
-    for x in sorted(rows, key=lambda x: int(x["ticket_id"]), reverse=True):
-        c1, c2, c3 = st.columns([1, 4, 2])
-        with c1:
-            if st.button(f"🔗 #{x['ticket_id']}", key=f"{key}_{x['ticket_id']}"):
-                open_ticket(x["ticket_id"])
-        c2.write(x["insured_name"] or "—")
-        c3.caption(x["status"])
+    search_col, page_size_col = st.columns([4, 1.2], vertical_alignment="bottom")
+    with search_col:
+        query = st.text_input(
+            "Search ticket / insured name", key=f"{key}_search",
+            placeholder="Cari nomor tiket atau insured name...",
+            label_visibility="collapsed",
+        ).strip().casefold()
+    with page_size_col:
+        page_size = st.selectbox("Rows", [10, 20, 50], index=0, key=f"{key}_size", label_visibility="collapsed")
+    filtered = [x for x in rows if not query or query in str(x['ticket_id']).casefold() or query in str(x['insured_name']).casefold()]
+    filtered.sort(key=lambda x: int(x['ticket_id']) if str(x['ticket_id']).isdigit() else 0, reverse=True)
+    n = len(filtered)
+    total_pages = max(1, (n + page_size - 1) // page_size)
+    page_key = f"{key}_page"
+    filter_key = f"{key}_filter_signature"
+    signature = (query, page_size)
+    if st.session_state.get(filter_key) != signature:
+        st.session_state[page_key] = 1
+        st.session_state[filter_key] = signature
+    current_page = min(max(1, int(st.session_state.get(page_key, 1))), total_pages)
+    st.session_state[page_key] = current_page
+    left = (current_page - 1) * page_size
+    page_rows = filtered[left:left + page_size]
+    if not page_rows:
+        st.info("Tidak ada tiket yang cocok dengan pencarian.")
+        return
+    # Only current page is rendered; no duplicate full-length list of buttons.
+    data = pd.DataFrame([{
+        "Ticket #": f"#{x['ticket_id']}",
+        "Insured Name": x['insured_name'] or "—",
+        "Class": x['class_of_business'] or "—",
+        "Status": x['status'],
+        "Last Update": x['updated_at'],
+    } for x in page_rows])
+    st.dataframe(data, hide_index=True, use_container_width=True, height=min(39 + len(page_rows) * 35, 435))
+    st.caption("Pilih nomor tiket untuk melihat detail dan PDF. PDF hanya dibuat saat tiket dibuka.")
+    with st.container():
+        cols = st.columns(5)
+        for i, rec in enumerate(page_rows):
+            with cols[i % 5]:
+                if st.button(f"#{rec['ticket_id']}", key=f"{key}_open_{rec['ticket_id']}", use_container_width=True):
+                    open_ticket(rec['ticket_id'])
+    nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 2], vertical_alignment="center")
+    nav1.caption(f"Menampilkan {left + 1}–{left + len(page_rows)} dari {n} tiket")
+    with nav2:
+        if st.button("← Prev", key=f"{key}_prev", disabled=current_page <= 1, use_container_width=True):
+            st.session_state[page_key] = current_page - 1
+            st.rerun()
+    with nav3:
+        if st.button("Next →", key=f"{key}_next", disabled=current_page >= total_pages, use_container_width=True):
+            st.session_state[page_key] = current_page + 1
+            st.rerun()
+    nav4.caption(f"Page {current_page} / {total_pages}")
 
 
 def safe(x):
@@ -148,6 +238,7 @@ def pdf_bytes(d):
     styles.add(ParagraphStyle(name="DashboardBody", parent=styles["BodyText"], fontSize=9, leading=13))
     styles.add(ParagraphStyle(name="DashboardSmall", parent=styles["BodyText"], fontSize=8, leading=11, textColor=colors.HexColor("#555555")))
     story = [Paragraph("SUPERDASHBOARD — ACCEPTANCE TICKET", styles["DashboardTitle"]),
+             Paragraph("#BePaperless", styles["DashboardSmall"]), Spacer(1, 6),
              Paragraph(f"Ticket #{safe(d['ticket_id'])} | Status: {safe(d['status'])}", styles["Heading2"]), Spacer(1, 9)]
     def section(title, pairs):
         story.append(Paragraph(safe(title), styles["Heading3"]))
@@ -169,6 +260,12 @@ def pdf_bytes(d):
         ("Total Sum Insured", f"{d['currency']} {d['total_sum_insured']}"),
         ("Brokerage / RIC", f"{d['currency']} {d['brokerage_ric']}"),
         ("Process to Reinsurance", "Yes" if d["process_reinsurance"] == "Yes" else "No"),
+    ])
+    section("Actuarial Insight", [
+        ("Loss Ratio", "Pending actuarial data"),
+        ("Combined Ratio", "Pending actuarial data"),
+    ])
+    section("Marketing Information", [
         ("Marketing Information", d["marketing_information"]),
         ("Filled by", f"{d['created_by']} at {d['sales_confirmed_at']}")
     ])
@@ -214,43 +311,52 @@ def cities(province_id):
 
 
 def new_ticket(user):
-    st.subheader("New Ticket")
-    # Controls outside the form rerun immediately, allowing conditional options.
-    src = st.selectbox("Source of Business *", SOURCES)
-    if src in SOURCES[2:]:
-        marketing_name = st.text_input("Marketing Name *")
-    else:
-        marketing_name = ""
-    country_names = sorted({c.name for c in pycountry.countries})
-    country = st.selectbox("Country *", country_names, index=country_names.index("Indonesia"))
+    st.subheader("Create New Acceptance Ticket")
+    st.caption("Complete quotation details • Fields marked * are mandatory")
+    # Dynamic locations outside form: changes update dependent city selector immediately.
+    lcol, rcol = st.columns(2, gap="large")
+    with lcol:
+        src = st.selectbox("Source of Business *", SOURCES)
+        marketing_name = st.text_input("Marketing Name *") if src in SOURCES[2:] else ""
+    with rcol:
+        country_names = sorted({c.name for c in pycountry.countries})
+        country = st.selectbox("Country *", country_names, index=country_names.index("Indonesia"))
     if country == "Indonesia":
         provs = provinces()
         names = list(provs)
         default_prov = next((n for n in names if "JAKARTA" in n.upper()), names[0])
-        province = st.selectbox("Province *", names, index=names.index(default_prov))
+        location_l, location_r = st.columns(2, gap="large")
+        with location_l:
+            province = st.selectbox("Province *", names, index=names.index(default_prov))
         city_choices = cities(provs[province])
-        city = st.selectbox("City *", city_choices) if city_choices else st.text_input("City *")
+        with location_r:
+            city = st.selectbox("City *", city_choices) if city_choices else st.text_input("City *")
     else:
-        province = st.text_input("Province / State *")
-        city = st.text_input("City *")
+        location_l, location_r = st.columns(2, gap="large")
+        with location_l:
+            province = st.text_input("Province / State *")
+        with location_r:
+            city = st.text_input("City *")
     with st.form("new_ticket", clear_on_submit=False):
-        class_of_business = st.selectbox("Class of Business *", CLASSES)
-        c1, c2 = st.columns(2)
+        st.markdown("#### Business & Policy Details")
+        c1, c2 = st.columns(2, gap="large")
         with c1:
+            class_of_business = st.selectbox("Class of Business *", CLASSES)
+            insured = st.text_input("Insured Name *")
             period_from = st.date_input("Period of Insurance — From *")
+            currency = st.selectbox("Currency", CURRENCIES)
+            sum_insured = st.number_input("Total Sum Insured *", min_value=0.0, step=1000000.0, format="%.2f")
         with c2:
+            occupation = st.text_input("Occupation *")
+            detail = st.text_input("Risk Location — Detail *")
             period_to = st.date_input("Period of Insurance — Up to *")
-        insured = st.text_input("Insured Name *")
-        occupation = st.text_input("Occupation *")
-        st.markdown("**Risk Location**")
-        detail = st.text_area("Risk Location — Detail *")
-        currency = st.selectbox("Currency", CURRENCIES)
-        sum_insured = st.number_input("Total Sum Insured *", min_value=0.0, step=1000000.0, format="%.2f")
-        brokerage = st.number_input("Brokerage / RIC", min_value=0.0, step=100000.0, format="%.2f")
-        to_reins = st.checkbox("Proses Tiket ke Reasuransi")
-        marketing_info = st.text_area("Marketing Information *", height=170)
+            brokerage = st.number_input("Brokerage / RIC", min_value=0.0, step=100000.0, format="%.2f")
+            to_reins = st.checkbox("Proses Tiket ke Reasuransi")
+        actuarial_insight()
+        st.markdown("#### Marketing Information")
+        marketing_info = st.text_area("Information & Explanation *", height=125, label_visibility="collapsed", placeholder="Provide marketing background, client context and quotation notes...")
         declaration = st.checkbox("Saya menyatakan bahwa informasi yang saya isi sudah benar")
-        submit = st.form_submit_button("Proses Tiket", type="primary", use_container_width=True)
+        submit = st.form_submit_button("Process Ticket →", type="primary", use_container_width=True)
     if submit:
         errors = []
         if src in SOURCES[2:] and not marketing_name.strip():
@@ -293,11 +399,15 @@ def new_ticket(user):
 def detail_ticket(d, role, user):
     st.button("← Back to Dashboard", on_click=page_back)
     st.subheader(f"Ticket #{d['ticket_id']} — {d['insured_name']}")
+    st.caption("SuperDashboard  ·  #BePaperless")
     st.info(f"Current Status: {d['status']}")
-    pdf = pdf_bytes(d)
-    st.download_button("⬇ Download Ticket PDF", pdf, file_name=f"SuperDashboard_Ticket_{d['ticket_id']}.pdf", mime="application/pdf")
-    with st.expander("📄 View Ticket PDF", expanded=True):
-        st.pdf(pdf, height=650)
+    actuarial_insight()
+    if st.toggle("Show PDF preview / download", value=False, key=f"pdf_{d['ticket_id']}"):
+        pdf = pdf_bytes(d)
+        st.download_button("⬇ Download Ticket PDF", pdf, file_name=f"SuperDashboard_Ticket_{d['ticket_id']}.pdf", mime="application/pdf")
+        st.pdf(pdf, height=560)
+    else:
+        st.caption("PDF loaded on demand to keep this page fast. Enable the preview above to view or download.")
     if role == "Admin":
         st.caption("Admin: read-only overview (no approval overrides in this MVP).")
         return
@@ -346,10 +456,14 @@ def detail_ticket(d, role, user):
         st.divider()
         st.subheader("Underwriting Decision & Allocation")
         with st.form("uw_form"):
-            decision = st.selectbox("Final Status *", FINAL_STATUSES)
-            share_role = st.selectbox("Our Role", ["Leader", "Member"])
-            our_share = st.number_input("Our Share (%)", min_value=0.0, max_value=100.0, value=100.0, step=0.01)
-            recommendation = st.text_area("Underwriting Recommendation *", height=170)
+            ua, ub, uc = st.columns(3)
+            with ua:
+                decision = st.selectbox("Final Status *", FINAL_STATUSES)
+            with ub:
+                share_role = st.selectbox("Our Role", ["Leader", "Member"])
+            with uc:
+                our_share = st.number_input("Our Share (%)", min_value=0.0, max_value=100.0, value=100.0, step=0.01)
+            recommendation = st.text_area("Underwriting Recommendation *", height=125)
             st.markdown("**Risk Allocation (% of Our Share)**")
             c1, c2 = st.columns(2)
             with c1:
@@ -389,6 +503,7 @@ def detail_ticket(d, role, user):
 
 def login():
     st.title("🎫 SuperDashboard")
+    st.markdown('<div class="tagline">#BePaperless</div>', unsafe_allow_html=True)
     st.write("Quotation Acceptance & Ticket Workflow")
     st.caption("Internal application — authorized personnel only")
     with st.form("login_form"):
@@ -407,12 +522,14 @@ def login():
 
 
 def main():
+    apply_theme()
     if "user" not in st.session_state:
         login()
         return
     user = st.session_state.user
     role = ROLES[user]
     st.sidebar.title("🎫 SuperDashboard")
+    st.sidebar.caption("#BePaperless")
     st.sidebar.write(f"**{role}**")
     st.sidebar.caption(user)
     if st.sidebar.button("Log out"):
@@ -449,6 +566,7 @@ def main():
         return
 
     st.title("SuperDashboard")
+    st.markdown('<div class="tagline">#BePaperless</div>', unsafe_allow_html=True)
     st.caption(f"Logged in: {user} · {role} · Asia/Jakarta timezone")
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Tickets", len(all_tickets))
@@ -486,6 +604,7 @@ def main():
             st.bar_chart(counts)
         st.info("Full audit trail is stored in the AuditLog worksheet in Google Sheets.")
     if st.button("🔄 Refresh Data"):
+        invalidate_tickets()
         st.rerun()
 
 
