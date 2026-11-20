@@ -1,4 +1,9 @@
 import io
+from urllib.parse import urlparse
+import base64
+import hashlib
+import math
+import mimetypes
 import json
 import html
 import re
@@ -12,6 +17,8 @@ import pycountry
 import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -57,10 +64,23 @@ EXTRA_HEADERS = [
 HEADERS += EXTRA_HEADERS
 # Append-only schema migration: preserve existing ticket rows and column order.
 HEADERS += ["exchange_rate_idr", "sum_insured_idr", "premium_rate_pct", "premium_original", "premium_idr"]
+# New fields always appended to preserve existing Google Sheets data.
+HEADERS += ["renewal_business"]
 CHAT_HEADERS = ["timestamp", "ticket_id", "username", "role", "type", "target_role", "message"]
 MENTION_HEADERS = ["mention_id", "timestamp", "ticket_id", "sender", "recipient", "message_excerpt"]
 MENTION_READ_HEADERS = ["mention_id", "username", "read_at"]
 AUDIT_HEADERS = ["timestamp", "ticket_id", "action", "username", "from_status", "to_status", "details"]
+ATTACHMENT_HEADERS = [
+    "attachment_id", "ticket_id", "category", "filename", "mime_type",
+    "size_bytes", "chunk_index", "chunk_count", "payload_base64",
+    "uploaded_by", "uploaded_at", "sha256"
+]
+ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg", "zip"}
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB per file
+MAX_FILES_PER_SUBMISSION = 8
+MAX_TOTAL_BYTES = 10 * 1024 * 1024  # Maximum combined size per ticket
+CHUNK_CHARS = 30000  # Compatibility with legacy small attachments
+
 
 
 CUSTOM_CSS = """
@@ -161,6 +181,252 @@ def get_worksheet(title, headers):
     elif existing != headers:
         raise ValueError(f"Header tab {title} tidak cocok. Jangan mengubah urutan header yang dibuat aplikasi.")
     return ws
+
+
+def attachment_ws():
+    return get_worksheet("TicketAttachments", ATTACHMENT_HEADERS)
+
+
+def validate_uploads(renewal, previous, supporting, existing_bytes=0, existing_count=0):
+    """Validate uploads before creating any ticket or writing any file."""
+    errors = []
+    previous = list(previous or [])
+    supporting = list(supporting or [])
+    files = [("Previous Document", f) for f in previous] + [("Supporting Document", f) for f in supporting]
+    if previous and not renewal:
+        errors.append("Previous Document hanya tersedia untuk Renewal Business.")
+    if len(files) + existing_count > MAX_FILES_PER_SUBMISSION:
+        errors.append(f"Maksimal {MAX_FILES_PER_SUBMISSION} dokumen per pengajuan.")
+    total_bytes = 0
+    for category, file in files:
+        ext = file.name.rsplit(".", 1)[-1].lower() if "." in file.name else ""
+        if ext not in ALLOWED_EXTENSIONS:
+            errors.append(f"Format file tidak didukung: {file.name}.")
+        total_bytes += file.size
+        if file.size > MAX_FILE_BYTES:
+            errors.append(f"{file.name} melebihi batas 10 MB per dokumen. Upload ke Google Drive, lalu masukkan linknya.")
+        if file.size == 0:
+            errors.append(f"{file.name} kosong.")
+    if total_bytes + existing_bytes > MAX_TOTAL_BYTES:
+        errors.append("Total dokumen melebihi 10 MB per tiket. Upload dokumen ke Google Drive, lalu masukkan linknya.")
+    return errors, files
+
+
+@st.cache_resource(show_spinner=False)
+def drive_service():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp"]),
+        scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_drive_folder_id():
+    return str(st.secrets.get("drive_folder_id", "")).strip()
+
+
+def drive_folder_ready():
+    return bool(get_drive_folder_id())
+
+
+def save_attachment(ticket_id, category, uploaded_file, user):
+    """Save new binary files in a Google Shared Drive folder; keep Sheets metadata.
+
+    Existing Sheets/base64 attachments are still readable. The Shared Drive must
+    have granted this service account permission to upload files.
+    """
+    if not drive_folder_ready():
+        raise ValueError("Upload memerlukan drive_folder_id (folder Shared Drive) pada Streamlit Secrets. Atau unggah manual ke Google Drive dan masukkan link dokumen.")
+    payload = uploaded_file.getvalue()
+    if not 0 < len(payload) <= MAX_FILE_BYTES:
+        raise ValueError("Ukuran file tidak valid atau melebihi 10 MB.")
+    attachment_id = uuid.uuid4().hex
+    digest = hashlib.sha256(payload).hexdigest()
+    clean_name = uploaded_file.name.replace("/", "_").replace("\\", "_")[:180]
+    mime = mimetypes.guess_type(clean_name)[0] or "application/octet-stream"
+    timestamp = now()
+    service = drive_service()
+    request = service.files().create(
+        body={"name": f"Ticket-{ticket_id}_{attachment_id[:8]}_{clean_name}",
+              "parents": [get_drive_folder_id()], "description": f"SuperDashboard ticket {ticket_id}"},
+        media_body=MediaIoBaseUpload(io.BytesIO(payload), mimetype=mime, resumable=True),
+        fields="id", supportsAllDrives=True
+    )
+    result = request.execute()
+    file_id = result["id"]
+    try:
+        attachment_ws().append_row([
+            attachment_id, str(ticket_id), category, clean_name, mime,
+            str(len(payload)), "0", "1", f"DRIVE:{file_id}",
+            user, timestamp, digest
+        ], value_input_option="RAW")
+    except Exception:
+        try:
+            service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+        except Exception:
+            pass
+        raise
+    log_action(ticket_id, "ATTACHMENT_UPLOAD", user, "", "", f"{category}: {clean_name} ({len(payload)} bytes)")
+    load_attachment_manifest.clear()
+    return attachment_id
+
+
+LINK_HEADERS = ["link_id", "ticket_id", "category", "label", "url", "uploaded_by", "uploaded_at"]
+
+
+def attachment_links_ws():
+    return get_worksheet("TicketAttachmentLinks", LINK_HEADERS)
+
+
+def valid_drive_link(url):
+    try:
+        parsed = urlparse(url.strip())
+        return parsed.scheme == "https" and parsed.hostname in ("drive.google.com", "docs.google.com")
+    except Exception:
+        return False
+
+
+def save_attachment_link(ticket_id, category, label, url, user):
+    if not valid_drive_link(url):
+        raise ValueError("Masukkan URL Google Drive atau Google Docs yang valid (https://...).")
+    label = label.strip()[:180] or "Google Drive document"
+    attachment_links_ws().append_row(
+        [uuid.uuid4().hex, str(ticket_id), category, label, url.strip(), user, now()],
+        value_input_option="RAW"
+    )
+    log_action(ticket_id, "ATTACHMENT_LINK", user, "", "", f"{category}: {label}")
+    load_attachment_links.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_attachment_links(ticket_id):
+    rows = attachment_links_ws().get_all_records()
+    return [r for r in rows if str(r.get("ticket_id", "")) == str(ticket_id)]
+
+
+def upload_limit_note():
+    st.caption("PDF, Word, Excel, gambar, ZIP · Maksimal 10 MB per file dan 10 MB total per tiket · Maksimal 8 file.")
+    st.info("Jika total lebih dari 10 MB, upload dokumen ke Google Drive lalu masukkan link dokumen. Pastikan penerima diberi akses Drive.")
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_attachment_manifest(ticket_id):
+    """Only read lightweight metadata columns, never base64 until download."""
+    ws = attachment_ws()
+    # Avoid repeatedly loading the large binary payload column I.
+    ids = ws.get("A2:H")
+    info = ws.get("J2:L")
+    records = {}
+    for offset, meta in enumerate(ids):
+        if len(meta) < 8 or str(meta[1]) != str(ticket_id):
+            continue
+        uid = meta[0]
+        if uid not in records:
+            extra = info[offset] if offset < len(info) else []
+            records[uid] = {
+                "attachment_id": uid, "category": meta[2], "filename": meta[3],
+                "mime": meta[4], "size_bytes": int(meta[5]),
+                "chunk_count": int(meta[7]), "rows": [],
+                "uploaded_by": extra[0] if len(extra)>0 else "",
+                "uploaded_at": extra[1] if len(extra)>1 else "",
+                "sha256": extra[2] if len(extra)>2 else "",
+            }
+        records[uid]["rows"].append((int(meta[6]), offset + 2))
+    return sorted(records.values(), key=lambda x: (x["uploaded_at"], x["filename"]), reverse=True)
+
+
+def read_attachment(record):
+    """Download legacy Sheets data or Drive binary only on explicit request."""
+    ws = attachment_ws()
+    ranges = [f"I{row}" for _, row in sorted(record["rows"])]
+    parts = ws.batch_get(ranges)
+    if len(parts) != record["chunk_count"]:
+        raise ValueError("Jumlah bagian dokumen tidak lengkap.")
+    first = parts[0][0][0] if parts and parts[0] and parts[0][0] else ""
+    if first.startswith("DRIVE:"):
+        file_id = first.split(":", 1)[1]
+        request = drive_service().files().get_media(fileId=file_id, supportsAllDrives=True)
+        stream = io.BytesIO()
+        downloader = MediaIoBaseDownload(stream, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        payload = stream.getvalue()
+    else:
+        encoded = "".join(result[0][0] if result and result[0] else "" for result in parts)
+        payload = base64.b64decode(encoded, validate=True)
+    if len(payload) != record["size_bytes"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
+        raise ValueError("Integritas dokumen gagal diverifikasi.")
+    return payload
+
+
+def attachment_panel(ticket_id, role, user, allow_upload=False, renewal_ticket=False):
+    """List documents for authorized ticket viewers; owners may add files."""
+    with st.expander("Documents & Attachments", expanded=False):
+        records = load_attachment_manifest(ticket_id)
+        links = load_attachment_links(ticket_id)
+        if not records and not links:
+            st.caption("Belum ada dokumen.")
+        for record in records:
+            c1, c2, c3 = st.columns([4, 2, 1.3], vertical_alignment="center")
+            c1.markdown(f"**{html.escape(record['filename'])}**")
+            c1.caption(f"{record['category']} · {record['size_bytes'] / 1024:.0f} KB")
+            c2.caption(f"{record['uploaded_by']} · {record['uploaded_at']}")
+            with c3:
+                # A real button prevents fetching binary for closed ticket views.
+                key = f"prepare_{record['attachment_id']}"
+                if st.button("Open", key=key):
+                    st.session_state[f"ready_{record['attachment_id']}"] = True
+                if st.session_state.get(f"ready_{record['attachment_id']}"):
+                    try:
+                        payload = read_attachment(record)
+                        st.download_button("Download", payload, file_name=record["filename"],
+                                           mime=record["mime"], key=f"download_{record['attachment_id']}")
+                    except Exception as exc:
+                        st.error(f"Dokumen tidak dapat dibaca: {exc}")
+        for link in links:
+            st.markdown(f"**{html.escape(str(link['label']))}** · [Open in Google Drive]({link['url']})")
+            st.caption(f"{link['category']} · {link['uploaded_by']} · {link['uploaded_at']}")
+        if allow_upload:
+            st.markdown("**Add Supporting Documents**")
+            new_docs = st.file_uploader("Upload supporting documents", type=sorted(ALLOWED_EXTENSIONS),
+                accept_multiple_files=True, key=f"more_files_{ticket_id}")
+            new_previous = []
+            if renewal_ticket:
+                new_previous = st.file_uploader("Upload previous document", type=sorted(ALLOWED_EXTENSIONS),
+                    accept_multiple_files=True, key=f"more_previous_{ticket_id}")
+            upload_limit_note()
+            if st.button("Upload Documents", key=f"upload_more_{ticket_id}", type="primary"):
+                errs, files = validate_uploads(renewal_ticket, new_previous, new_docs,
+                    existing_bytes=sum(r["size_bytes"] for r in records), existing_count=len(records))
+                if files and not drive_folder_ready():
+                    errs.append("Upload file memerlukan drive_folder_id pada Secrets. Gunakan Google Drive link di bawah jika belum tersedia.")
+                if not new_docs and not new_previous:
+                    errs.append("Pilih dokumen terlebih dahulu.")
+                if errs:
+                    for err in errs: st.error(err)
+                else:
+                    successes = 0
+                    for category, doc in files:
+                        try:
+                            save_attachment(ticket_id, category, doc, user)
+                            successes += 1
+                        except Exception as exc:
+                            st.error(f"Upload {doc.name} gagal: {exc}")
+                    if successes:
+                        st.success(f"{successes} dokumen tersimpan.")
+                        st.rerun()
+            st.markdown("**Google Drive Link**")
+            with st.form(f"attachment_link_{ticket_id}"):
+                link_cat = st.selectbox("Document category", ["Supporting Document"] + (["Previous Document"] if renewal_ticket else []))
+                link_label = st.text_input("Document name")
+                link_url = st.text_input("Google Drive URL", placeholder="https://drive.google.com/file/d/...")
+                if st.form_submit_button("Save Link"):
+                    try:
+                        save_attachment_link(ticket_id, link_cat, link_label, link_url, user)
+                        st.success("Link tersimpan.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
 
 def ticket_ws():
@@ -582,6 +848,7 @@ def pdf_bytes(d):
         *money_details(d),
         ("Brokerage / RIC", f"{d['currency']} {amount(d['brokerage_ric'])}"),
         ("Reinsurance Required", "Yes" if d['process_reinsurance'] == 'Yes' else "No"),
+        ("Renewal Business", "Yes" if d.get('renewal_business') == 'Yes' else "No"),
     ])
 
     story.append(Paragraph("02 / ACTUARIAL INSIGHT", styles["SD_H"]))
@@ -647,6 +914,17 @@ def pdf_bytes(d):
             ('TOPPADDING',(0,0),(-1,-1),9),('BOTTOMPADDING',(0,0),(-1,-1),9),
         ]))
         story.append(sig_table)
+    # Attachment metadata is included; binary documents are available in the app.
+    attachments = load_attachment_manifest(d["ticket_id"])
+    document_links = load_attachment_links(d["ticket_id"])
+    if attachments or document_links:
+        pairs_section("07 / Supporting Documents", [
+            (f"{item['category']}", f"{item['filename']} · uploaded by {item['uploaded_by']} at {item['uploaded_at']}")
+            for item in attachments
+        ] + [
+            (f"{item['category']}", f"{item['label']} · Google Drive link · {item['uploaded_by']}")
+            for item in document_links
+        ])
     story.append(Spacer(1,14))
     story.append(P("Internal workflow record. This document does not constitute a policy, cover note, or binder.", "SD_Muted"))
 
@@ -783,6 +1061,12 @@ def new_ticket(user):
             province = st.text_input("Province / State *")
         with location_r:
             city = st.text_input("City *")
+    renewal = st.checkbox("Renewal Business", key="renewal_business_toggle")
+    if renewal:
+        previous_documents = st.file_uploader("Upload Previous Document", type=sorted(ALLOWED_EXTENSIONS),
+            accept_multiple_files=True, key="previous_docs")
+    else:
+        previous_documents = []
     additional = st.checkbox("Make an Additional Form", key="additional_form_toggle")
     st.markdown("#### Sum Insured & Premium")
     money_l, money_r = st.columns(2, gap="large")
@@ -824,13 +1108,23 @@ def new_ticket(user):
                 additional_inputs["additional_insured"] = st.text_input("Name of Insured", value=insured)
                 additional_inputs["additional_coverage"] = st.text_input("Coverage")
                 additional_inputs["additional_fee"] = f"{st.number_input('Total of Additional Fee', min_value=0.0, format='%.2f'):.2f}"
+        st.markdown("#### Supporting Documents")
+        supporting_documents = st.file_uploader("Upload supporting documents", type=sorted(ALLOWED_EXTENSIONS),
+            accept_multiple_files=True, key="supporting_docs")
+        upload_limit_note()
+        drive_url_new = st.text_input("Google Drive link (optional)", placeholder="https://drive.google.com/file/d/...")
+        drive_label_new = st.text_input("Google Drive document name (optional)")
         actuarial_insight()
         st.markdown("#### Marketing Information")
         marketing_info = st.text_area("Information & Explanation *", height=125, label_visibility="collapsed", placeholder="Provide marketing background, client context and quotation notes...")
         declaration = st.checkbox("Saya menyatakan bahwa informasi yang saya isi sudah benar")
         submit = st.form_submit_button("Process Ticket →", type="primary", use_container_width=True)
     if submit:
-        errors = []
+        errors, all_uploads = validate_uploads(renewal, previous_documents, supporting_documents)
+        if all_uploads and not drive_folder_ready():
+            errors.append("Upload file memerlukan drive_folder_id (Shared Drive) pada Secrets. Alternatif: upload ke Google Drive manual dan isi link dokumen.")
+        if drive_url_new.strip() and not valid_drive_link(drive_url_new):
+            errors.append("Link Google Drive tidak valid.")
         if src != "Direct Business" and not marketing_name.strip():
             errors.append("Marketing Name wajib diisi untuk source yang dipilih.")
         if src != "Direct Business" and not our_client.strip():
@@ -861,6 +1155,7 @@ def new_ticket(user):
             "ticket_id": tid, "status": "Pending Marketing", "created_at": stamp,
             "created_by": user, "source_of_business": src, "marketing_name": marketing_name,
             "our_client": our_client,
+            "renewal_business": "Yes" if renewal else "No",
             "additional_form": "Yes" if additional else "No",
             "additional_status": "Pending Marketing" if additional else "",
             "additional_sales_signed_by": user if additional else "",
@@ -880,7 +1175,21 @@ def new_ticket(user):
         d.update(additional_inputs)
         append_ticket(d)
         log_action(tid, "CREATE", user, "", "Pending Marketing", "Ticket created by Sales Support")
-        st.success(f"Ticket #{tid} berhasil dibuat. Status: Pending Marketing")
+        failed = []
+        for category, uploaded_file in all_uploads:
+            try:
+                save_attachment(tid, category, uploaded_file, user)
+            except Exception as exc:
+                failed.append(f"{uploaded_file.name}: {exc}")
+        if drive_url_new.strip():
+            try:
+                save_attachment_link(tid, "Supporting Document", drive_label_new or "Google Drive document", drive_url_new, user)
+            except Exception as exc:
+                failed.append(f"Google Drive link: {exc}")
+        if failed:
+            st.error("Ticket tersimpan, tetapi sebagian dokumen gagal diunggah. " + " | ".join(failed))
+        else:
+            st.success(f"Ticket #{tid} berhasil dibuat. Status: Pending Marketing")
         st.session_state.selected_ticket = tid
         st.rerun()
 
@@ -1037,6 +1346,11 @@ def detail_ticket(d, role, user):
     st.subheader(f"Ticket #{d['ticket_id']} — {d['insured_name']}")
     st.caption("SuperDashboard  ·  #BePaperless")
     st.info(f"Current Status: {d['status']}")
+    if d.get("renewal_business") == "Yes":
+        st.caption("Renewal Business")
+    attachment_panel(d["ticket_id"], role, user,
+                     allow_upload=(role == "Sales Support" and d.get("created_by") == user),
+                     renewal_ticket=(d.get("renewal_business") == "Yes"))
     details = money_details(d)
     with st.expander("Sum Insured & Premium", expanded=True):
         for label, value in details:
