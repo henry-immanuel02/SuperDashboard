@@ -55,6 +55,8 @@ EXTRA_HEADERS = [
     "additional_president_signed_at",
 ]
 HEADERS += EXTRA_HEADERS
+# Append-only schema migration: preserve existing ticket rows and column order.
+HEADERS += ["exchange_rate_idr", "sum_insured_idr", "premium_rate_pct", "premium_original", "premium_idr"]
 CHAT_HEADERS = ["timestamp", "ticket_id", "username", "role", "type", "target_role", "message"]
 MENTION_HEADERS = ["mention_id", "timestamp", "ticket_id", "sender", "recipient", "message_excerpt"]
 MENTION_READ_HEADERS = ["mention_id", "username", "read_at"]
@@ -337,7 +339,8 @@ SALES_FIELDS = {
     "source_of_business", "our_client", "marketing_name", "class_of_business",
     "period_from", "period_to", "insured_name", "occupation", "country",
     "province", "city", "risk_detail", "currency", "total_sum_insured",
-    "brokerage_ric", "process_reinsurance", "additional_date", "additional_ps_no",
+    "brokerage_ric", "process_reinsurance", "exchange_rate_idr", "sum_insured_idr",
+    "premium_rate_pct", "premium_original", "premium_idr", "additional_date", "additional_ps_no",
     "additional_intermediary", "additional_insured", "additional_coverage", "additional_fee"
 }
 
@@ -437,6 +440,62 @@ def safe(x):
     return html.escape(str(x or "—")).replace("\n", "<br/>")
 
 
+def amount(value, decimals=2):
+    """Indonesian monetary grouping, with no unnecessary decimal zeros."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    raw = f"{number:,.{decimals}f}".rstrip("0").rstrip(".")
+    return raw.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def premium_values(currency, sum_insured, rate_pct, exchange_rate):
+    """Rate entered as percent (e.g. 0.25 means 0.25%)."""
+    multiplier = 1.0 if currency == "IDR" else float(exchange_rate)
+    original = float(sum_insured) * float(rate_pct) / 100.0
+    return float(sum_insured) * multiplier, original, original * multiplier
+
+
+def money_details(d):
+    curr = d.get("currency", "IDR") or "IDR"
+    fx_raw = d.get("exchange_rate_idr", "")
+    fx = float(fx_raw) if str(fx_raw).strip() else (1.0 if curr == "IDR" else None)
+    tsi = d.get("total_sum_insured", "")
+    premium_rate = d.get("premium_rate_pct", "")
+    fields = [("Total Sum Insured", f"{curr} {amount(tsi)}")]
+    if curr != "IDR":
+        fields.append(("Exchange Rate", f"1 {curr} = IDR {amount(fx)}" if fx else "Not recorded"))
+        fields.append(("Total Sum Insured (IDR)",
+                       f"IDR {amount(d.get('sum_insured_idr') or float(tsi or 0) * fx)}" if fx else "Not recorded"))
+    fields.append(("Premium Rate", f"{amount(premium_rate, 6)}%" if str(premium_rate).strip() else "Not recorded"))
+    if str(premium_rate).strip():
+        _, computed_original, computed_idr = premium_values(curr, tsi, premium_rate, fx or 1)
+        fields.append(("Estimated Premium", f"{curr} {amount(d.get('premium_original') or computed_original)}"))
+        if curr != "IDR" and fx:
+            fields.append(("Estimated Premium (IDR)", f"IDR {amount(d.get('premium_idr') or computed_idr)}"))
+    else:
+        fields.append(("Estimated Premium", "Not recorded"))
+    return fields
+
+
+def premium_preview(currency, tsi, rate, fx):
+    tsi_idr, premium_original, premium_idr = premium_values(currency, tsi, rate, fx)
+    st.markdown("**Premium Calculation**")
+    if currency == "IDR":
+        a, b = st.columns(2)
+        a.metric("Total Sum Insured", f"IDR {amount(tsi)}")
+        b.metric("Estimated Premium", f"IDR {amount(premium_original)}")
+    else:
+        a, b, c = st.columns(3)
+        a.metric(f"Sum Insured ({currency})", f"{currency} {amount(tsi)}")
+        b.metric("Sum Insured (IDR)", f"IDR {amount(tsi_idr)}")
+        c.metric(f"Premium ({currency})", f"{currency} {amount(premium_original)}")
+        st.caption(f"Estimated Premium (IDR): IDR {amount(premium_idr)} · 1 {currency} = IDR {amount(fx)}")
+    st.caption("Premium = Sum Insured × Premium Rate (%). Indicative gross premium before any additional fees or adjustments.")
+    return tsi_idr, premium_original, premium_idr
+
+
 def pdf_bytes(d):
     """Premium A4 acceptance record with consistent hierarchy and page folios."""
     buff = io.BytesIO()
@@ -520,8 +579,8 @@ def pdf_bytes(d):
         ("Period of Insurance", f"{d['period_from']} — {d['period_to']}"),
         ("Insured Name", d['insured_name']), ("Occupation", d['occupation']),
         ("Risk Location", ", ".join(str(d[k]) for k in ['risk_detail', 'city', 'province', 'country'] if d[k])),
-        ("Total Sum Insured", f"{d['currency']} {d['total_sum_insured']}"),
-        ("Brokerage / RIC", f"{d['currency']} {d['brokerage_ric']}"),
+        *money_details(d),
+        ("Brokerage / RIC", f"{d['currency']} {amount(d['brokerage_ric'])}"),
         ("Reinsurance Required", "Yes" if d['process_reinsurance'] == 'Yes' else "No"),
     ])
 
@@ -557,7 +616,7 @@ def pdf_bytes(d):
         ("Treaty QS (%)", d['qs_pct']), ("Treaty SPL (%)", d['spl_pct']),
         ("Facultative (%)", d['facultative_pct']),
         ("Allocation Total (%)", d['allocation_total_pct']),
-        ("Confirmed by", f"{d['uw_confirmed_by']} at {d['uw_confirmed_at']}" if d['uw_confirmed_at'] else "Pending"),
+        ("Reviewed / Approved by Underwriting", f"{d['uw_confirmed_by']} at {d['uw_confirmed_at']}" if d['uw_confirmed_at'] else "Pending"),
     ])
     if d.get('additional_form') == 'Yes':
         pairs_section("06 / Additional Form", [
@@ -565,7 +624,7 @@ def pdf_bytes(d):
             ("Name of Intermediary", d.get('additional_intermediary', '')),
             ("Name of Insured", d.get('additional_insured', '')),
             ("Coverage", d.get('additional_coverage', '')),
-            ("Total of Additional Fee", f"{d.get('currency','IDR')} {d.get('additional_fee','')}"),
+            ("Total of Additional Fee", f"{d.get('currency','IDR')} {amount(d.get('additional_fee'))}"),
             ("Approval Status", d.get('additional_status', '')),
         ])
         story.append(Paragraph("SIGNATURE REGISTER", styles["SD_H"]))
@@ -725,6 +784,21 @@ def new_ticket(user):
         with location_r:
             city = st.text_input("City *")
     additional = st.checkbox("Make an Additional Form", key="additional_form_toggle")
+    st.markdown("#### Sum Insured & Premium")
+    money_l, money_r = st.columns(2, gap="large")
+    with money_l:
+        currency = st.selectbox("Currency *", CURRENCIES, key="new_currency")
+        sum_insured = st.number_input("Total Sum Insured *", min_value=0.0, step=1000000.0,
+                                      format="%.2f", key="new_tsi")
+    with money_r:
+        premium_rate = st.number_input("Premium Rate (%) *", min_value=0.0, max_value=100.0,
+                                       step=0.01, format="%.6f", key="new_premium_rate",
+                                       help="Contoh: isi 0.25 untuk rate 0,25%")
+        fx = (st.number_input(f"Exchange Rate · 1 {currency} = IDR *", min_value=0.000001,
+                              value=16000.0 if currency == "USD" else 1.0,
+                              step=1.0, format="%.4f", key=f"new_fx_{currency}")
+              if currency != "IDR" else 1.0)
+    tsi_idr, premium_original, premium_idr = premium_preview(currency, sum_insured, premium_rate, fx)
     with st.form("new_ticket", clear_on_submit=False):
         st.markdown("#### Business & Policy Details")
         c1, c2 = st.columns(2, gap="large")
@@ -732,8 +806,6 @@ def new_ticket(user):
             class_of_business = st.selectbox("Class of Business *", CLASSES)
             insured = st.text_input("Insured Name *")
             period_from = st.date_input("Period of Insurance — From *")
-            currency = st.selectbox("Currency", CURRENCIES)
-            sum_insured = st.number_input("Total Sum Insured *", min_value=0.0, step=1000000.0, format="%.2f")
         with c2:
             occupation = st.text_input("Occupation *")
             detail = st.text_input("Risk Location — Detail *")
@@ -771,6 +843,10 @@ def new_ticket(user):
             errors.append("Insured, Occupation, Province, City, Risk Detail, dan Marketing Information wajib diisi.")
         if sum_insured <= 0:
             errors.append("Total Sum Insured harus lebih dari nol.")
+        if premium_rate <= 0:
+            errors.append("Premium Rate harus lebih dari nol.")
+        if currency != "IDR" and fx <= 0:
+            errors.append("Exchange Rate harus lebih dari nol.")
         if not declaration:
             errors.append("Harap centang pernyataan kebenaran data.")
         if errors:
@@ -794,6 +870,9 @@ def new_ticket(user):
             "country": country, "province": province,
             "city": city, "risk_detail": detail,
             "currency": currency, "total_sum_insured": f"{sum_insured:.2f}",
+            "exchange_rate_idr": f"{fx:.6f}", "sum_insured_idr": f"{tsi_idr:.2f}",
+            "premium_rate_pct": f"{premium_rate:.6f}", "premium_original": f"{premium_original:.2f}",
+            "premium_idr": f"{premium_idr:.2f}",
             "brokerage_ric": f"{brokerage:.2f}", "process_reinsurance": "Yes" if to_reins else "No",
             "marketing_information": marketing_info, "sales_confirmed_at": stamp,
             "updated_at": stamp, "updated_by": user
@@ -810,6 +889,25 @@ def edit_owned_fields(d, role, user):
     """Section-owner edits, independent of current workflow state; audit every update."""
     if role == "Sales Support" and d["created_by"] == user:
         with st.expander("Edit Sales Support Information", expanded=False):
+            st.markdown("**Sum Insured & Premium**")
+            keyprefix = f"edit_{d['ticket_id']}"
+            mx, my = st.columns(2)
+            with mx:
+                currency = st.selectbox("Currency", CURRENCIES,
+                    index=CURRENCIES.index(d['currency']) if d['currency'] in CURRENCIES else 0,
+                    key=f"{keyprefix}_currency")
+                tsi = st.number_input("Total Sum Insured", value=float(d.get('total_sum_insured') or 0),
+                                      min_value=0.0, format="%.2f", key=f"{keyprefix}_tsi")
+            with my:
+                rate = st.number_input("Premium Rate (%)", value=float(d.get('premium_rate_pct') or 0),
+                                       min_value=0.0, max_value=100.0, step=0.01,
+                                       format="%.6f", key=f"{keyprefix}_rate")
+                fx_default = float(d.get('exchange_rate_idr') or (16000.0 if currency == "USD" else 1.0))
+                fx = (st.number_input(f"Exchange Rate · 1 {currency} = IDR",
+                        value=fx_default if d.get('currency') == currency else (16000.0 if currency == 'USD' else 1.0),
+                        min_value=0.000001, format="%.4f", key=f"{keyprefix}_fx_{currency}")
+                      if currency != "IDR" else 1.0)
+            tsi_idr, premium_original, premium_idr = premium_preview(currency, tsi, rate, fx)
             with st.form(f"sales_edit_{d['ticket_id']}"):
                 a, b = st.columns(2)
                 with a:
@@ -819,8 +917,6 @@ def edit_owned_fields(d, role, user):
                     cob = st.selectbox("Class", CLASSES, index=CLASSES.index(d['class_of_business']) if d['class_of_business'] in CLASSES else 0)
                     insured = st.text_input("Insured Name", d['insured_name'])
                     occupation = st.text_input("Occupation", d['occupation'])
-                    currency = st.selectbox("Currency", CURRENCIES, index=CURRENCIES.index(d['currency']) if d['currency'] in CURRENCIES else 0)
-                    tsi = st.number_input("Total Sum Insured", value=float(d.get('total_sum_insured') or 0), min_value=0.0, format="%.2f")
                 with b:
                     date_from = st.date_input("Period From", value=datetime.fromisoformat(d['period_from']).date())
                     date_to = st.date_input("Period To", value=datetime.fromisoformat(d['period_to']).date())
@@ -845,14 +941,17 @@ def edit_owned_fields(d, role, user):
                         extra['additional_fee'] = f"{st.number_input('Total Additional Fee', value=float(d.get('additional_fee') or 0), min_value=0.0, format='%.2f'):.2f}"
                 save = st.form_submit_button("Save Changes")
             if save:
-                if not all([insured.strip(), occupation.strip(), detail.strip(), city.strip(), province.strip(), country.strip()]) or tsi <= 0 or date_to < date_from:
+                if not all([insured.strip(), occupation.strip(), detail.strip(), city.strip(), province.strip(), country.strip()]) or tsi <= 0 or rate <= 0 or date_to < date_from:
                     st.error("Periksa isian wajib, nilai TSI, dan periode asuransi.")
                 elif src != "Direct Business" and not (client.strip() and mkt.strip()):
                     st.error("Our Client dan Marketing Name wajib diisi untuk non-direct business.")
                 else:
                     changes = dict(source_of_business=src, our_client=client, marketing_name=mkt,
                         class_of_business=cob, insured_name=insured, occupation=occupation,
-                        currency=currency, total_sum_insured=f"{tsi:.2f}", period_from=str(date_from),
+                        currency=currency, total_sum_insured=f"{tsi:.2f}",
+                        exchange_rate_idr=f"{fx:.6f}", sum_insured_idr=f"{tsi_idr:.2f}",
+                        premium_rate_pct=f"{rate:.6f}", premium_original=f"{premium_original:.2f}",
+                        premium_idr=f"{premium_idr:.2f}", period_from=str(date_from),
                         period_to=str(date_to), country=country, province=province, city=city,
                         risk_detail=detail, brokerage_ric=f"{ric:.2f}")
                     if not d.get('marketing_reviewed_at'):
@@ -938,6 +1037,10 @@ def detail_ticket(d, role, user):
     st.subheader(f"Ticket #{d['ticket_id']} — {d['insured_name']}")
     st.caption("SuperDashboard  ·  #BePaperless")
     st.info(f"Current Status: {d['status']}")
+    details = money_details(d)
+    with st.expander("Sum Insured & Premium", expanded=True):
+        for label, value in details:
+            st.markdown(f"**{label}:** {value}")
     if d.get("source_of_business") != "Direct Business":
         st.caption(f"Our Client: {d.get('our_client', '—')} · Marketing Name: {d.get('marketing_name', '—')}")
     if d.get("additional_form") == "Yes":
