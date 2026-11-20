@@ -1,6 +1,8 @@
 import io
 import json
 import html
+import re
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,9 @@ ROLES = {
     "gilang.k@korindo.co.id": "Underwriting",
     "vandytiagladis@korindo.co.id": "Reinsurance",
     "henryimmanuel@korindo.co.id": "Admin",
+    "hadi@korindo.co.id": "Technical Director",
+    "jhson@korindo.co.id": "Marketing Director",
+    "sweetchj@korindo.co.id": "President Director",
 }
 SOURCES = ["Direct Business", "Inward Fac. Business", "Direct Client/Broker", "R/I Broker/Ceding Company"]
 CLASSES = ["PAREQ", "MB"]  # Add more classes here
@@ -39,6 +44,20 @@ HEADERS = [
     "underwriting_recommendation", "own_retention_pct", "qs_pct", "spl_pct", "facultative_pct",
     "allocation_total_pct", "uw_confirmed_by", "uw_confirmed_at", "updated_at", "updated_by"
 ]
+EXTRA_HEADERS = [
+    "our_client", "additional_form", "additional_date", "additional_ps_no",
+    "additional_intermediary", "additional_insured", "additional_coverage",
+    "additional_fee", "additional_status", "additional_sales_signed_by",
+    "additional_sales_signed_at", "additional_marketing_signed_by",
+    "additional_marketing_signed_at", "additional_technical_signed_by",
+    "additional_technical_signed_at", "additional_marketing_director_signed_by",
+    "additional_marketing_director_signed_at", "additional_president_signed_by",
+    "additional_president_signed_at",
+]
+HEADERS += EXTRA_HEADERS
+CHAT_HEADERS = ["timestamp", "ticket_id", "username", "role", "type", "target_role", "message"]
+MENTION_HEADERS = ["mention_id", "timestamp", "ticket_id", "sender", "recipient", "message_excerpt"]
+MENTION_READ_HEADERS = ["mention_id", "username", "read_at"]
 AUDIT_HEADERS = ["timestamp", "ticket_id", "action", "username", "from_status", "to_status", "details"]
 
 
@@ -74,6 +93,12 @@ h3 { font-size:1.1rem !important; margin-top:.35rem !important; }
 .actuarial-label { font-size:11px; font-weight:750; letter-spacing:.09em; color:#536982; }
 .actuarial-value { font-size:25px; font-weight:700; margin-top:3px; color:#1c436c; }
 .actuarial-note { font-size:11px; color:#7c8b9b; margin-top:3px; }
+.notification-heading {font-size:15px;font-weight:750;color:#193956;margin:12px 0 8px;}
+.notification-heading span {font-size:12px;color:#a44a16;font-weight:650;margin-left:8px;}
+.signature-card { border:1px solid #dce5ef; border-radius:10px; padding:12px 14px; min-height:94px; background:#fff; }
+.signature-role {font-size:11px;font-weight:750;color:#60768c;text-transform:uppercase;letter-spacing:.045em;}
+.signature-value {margin-top:10px;font-size:12px;color:#1d426a;font-weight:600;}
+.signature-value span {font-size:10px;color:#6b7d8f;font-weight:400;}
 .tagline { font-size:13px; font-weight:750; letter-spacing:.07em; color:#1f639e; margin:-5px 0 12px; }
 [data-testid="stAppViewContainer"] { background:#f8fafc; }
 [data-testid="stHeader"] { background:transparent; }
@@ -108,6 +133,14 @@ def get_spreadsheet():
     return gc.open_by_key(st.secrets["spreadsheet_id"])
 
 
+def column_letter(n):
+    result = ""
+    while n:
+        n, rem = divmod(n-1, 26)
+        result = chr(65+rem) + result
+    return result
+
+
 def get_worksheet(title, headers):
     spreadsheet = get_spreadsheet()
     try:
@@ -115,6 +148,12 @@ def get_worksheet(title, headers):
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=max(30, len(headers)))
     existing = ws.row_values(1)
+    if title == "Tickets" and existing and existing != headers and headers[:len(existing)] == existing:
+        # Non-destructive migration: append new columns to the right of existing data.
+        if ws.col_count < len(headers):
+            ws.add_cols(len(headers) - ws.col_count)
+        ws.update(range_name=f"{column_letter(len(existing)+1)}1:{column_letter(len(headers))}1", values=[headers[len(existing):]])
+        existing = headers
     if not existing:
         ws.update(range_name="A1", values=[headers])
     elif existing != headers:
@@ -128,6 +167,107 @@ def ticket_ws():
 
 def audit_ws():
     return get_worksheet("AuditLog", AUDIT_HEADERS)
+
+
+def chat_ws():
+    return get_worksheet("TicketChat", CHAT_HEADERS)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_chat(ticket_id):
+    values = chat_ws().get_all_values()
+    return [dict(zip(CHAT_HEADERS, row + [""] * (len(CHAT_HEADERS) - len(row))))
+            for row in values[1:] if row and str(row[1]) == str(ticket_id)]
+
+
+def mention_ws():
+    return get_worksheet("TicketMentions", MENTION_HEADERS)
+
+
+def mention_read_ws():
+    return get_worksheet("MentionReads", MENTION_READ_HEADERS)
+
+
+def mention_aliases(email):
+    local = email.split("@")[0].lower()
+    return {local, email.lower()}
+
+
+def extract_mentions(message, selected_people, sender):
+    people = set(selected_people)
+    tokens = {t.lower().strip(".,:;!?()[]") for t in re.findall(r"@([\w.+-]+(?:@[\w.-]+)?)", message)}
+    for email in ROLES:
+        if tokens.intersection(mention_aliases(email)):
+            people.add(email)
+    people.discard(sender)
+    return sorted(people)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_mentions(username):
+    # Separate small worksheets keep notifications independent of ticket schema.
+    notices = mention_ws().get_all_values()[1:]
+    read_ids = {row[0] for row in mention_read_ws().get_all_values()[1:]
+                if len(row) >= 2 and row[1] == username}
+    return [dict(zip(MENTION_HEADERS, row + [""] * (len(MENTION_HEADERS) - len(row))))
+            for row in notices if len(row) >= 5 and row[4] == username and row[0] not in read_ids]
+
+
+def mark_mentions_read(username, ids):
+    if ids:
+        timestamp = now()
+        mention_read_ws().append_rows([[item, username, timestamp] for item in ids], value_input_option="RAW")
+        load_mentions.clear()
+
+
+def notification_panel(user, tickets):
+    # Notifications display only mentions directed to the signed-in user.
+    try:
+        pending = load_mentions(user)
+    except Exception:
+        st.warning("Notifications are temporarily unavailable.")
+        return
+    if not pending:
+        return
+    pending.sort(key=lambda item: item["timestamp"], reverse=True)
+    st.markdown(f'<div class="notification-heading">Mentions <span>{len(pending)} unread</span></div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        display = pending[:50]
+        data = pd.DataFrame([{
+            "Ticket": f"#{item['ticket_id']}",
+            "From": item["sender"].split("@")[0],
+            "Message": item["message_excerpt"],
+            "Time": item["timestamp"],
+        } for item in display])
+        event = st.dataframe(data, on_select="rerun", selection_mode="single-row",
+                             hide_index=True, use_container_width=True,
+                             key=f"mention_table_{st.session_state.get('table_nonce', 0)}",
+                             column_config={"Ticket": st.column_config.TextColumn(width="small"),
+                                            "Message": st.column_config.TextColumn(width="large")})
+        chosen = event.selection.rows
+        if chosen:
+            item = display[chosen[0]]
+            # Existing per-role access control still applies when ticket is opened.
+            mark_mentions_read(user, [item["mention_id"]])
+            st.session_state.table_nonce = st.session_state.get("table_nonce", 0) + 1
+            open_ticket(item["ticket_id"])
+        if st.button("Mark all as read", key="mark_all_mentions"):
+            mark_mentions_read(user, [item["mention_id"] for item in pending])
+            st.rerun()
+
+
+def add_message(ticket_id, user, role, kind, target, message, recipients=None):
+    chat_ws().append_row([now(), str(ticket_id), user, role, kind, target, message.strip()], value_input_option="RAW")
+    recipients = extract_mentions(message, recipients or [], user)
+    if recipients:
+        timestamp = now()
+        excerpt = message.strip().replace("\n", " ")[:180]
+        mention_ws().append_rows([[uuid.uuid4().hex, timestamp, str(ticket_id), user, email, excerpt]
+                                  for email in recipients], value_input_option="RAW")
+        load_mentions.clear()
+    load_chat.clear()
+    log_action(ticket_id, kind.upper(), user, "", "", f"Target: {target}; Mentions: {', '.join(recipients)}")
+
 
 
 @st.cache_data(ttl=45, show_spinner=False)
@@ -163,8 +303,52 @@ def append_ticket(d):
 
 def update_ticket(d):
     row = int(d["_row"])
-    ticket_ws().update(range_name=f"A{row}:AM{row}", values=[[str(d.get(h, "")) for h in HEADERS]], value_input_option="RAW")
+    ticket_ws().update(range_name=f"A{row}:{column_letter(len(HEADERS))}{row}", values=[[str(d.get(h, "")) for h in HEADERS]], value_input_option="RAW")
     invalidate_tickets()
+
+
+def patch_ticket(ticket_id, changes, allowed_fields=None):
+    """Write only owned columns; never rewrite a different team's fields."""
+    if allowed_fields is not None and not set(changes).issubset(set(allowed_fields)):
+        raise PermissionError("Field ownership violation")
+    ws = ticket_ws()
+    records = ws.get_all_values()
+    if not records or records[0] != HEADERS:
+        raise ValueError("Ticket schema mismatch")
+    row_num = None
+    for idx, row in enumerate(records[1:], 2):
+        if row and str(row[0]) == str(ticket_id):
+            row_num = idx
+            break
+    if row_num is None:
+        raise ValueError("Ticket not found")
+    for key, value in changes.items():
+        col = column_letter(HEADERS.index(key) + 1)
+        ws.update_acell(f"{col}{row_num}", str(value))
+    invalidate_tickets()
+
+
+def fresh_ticket(ticket_id):
+    invalidate_tickets()
+    return next((x for x in load_tickets() if x["ticket_id"] == str(ticket_id)), None)
+
+
+SALES_FIELDS = {
+    "source_of_business", "our_client", "marketing_name", "class_of_business",
+    "period_from", "period_to", "insured_name", "occupation", "country",
+    "province", "city", "risk_detail", "currency", "total_sum_insured",
+    "brokerage_ric", "process_reinsurance", "additional_date", "additional_ps_no",
+    "additional_intermediary", "additional_insured", "additional_coverage", "additional_fee"
+}
+
+
+def audit_edit(ticket_id, user, role, changes):
+    if not changes:
+        return
+    changes = dict(changes)
+    changes.update(updated_at=now(), updated_by=user)
+    patch_ticket(ticket_id, changes, set(changes))
+    log_action(ticket_id, f"EDIT_{role.upper().replace(' ', '_')}", user, "", "", ", ".join(changes.keys()))
 
 
 def open_ticket(ticket_id):
@@ -331,7 +515,7 @@ def pdf_bytes(d):
     story.append(headline)
 
     pairs_section("01 / Business & Policy Details", [
-        ("Source of Business", d['source_of_business']), ("Marketing Name", d['marketing_name']),
+        ("Source of Business", d['source_of_business']), ("Our Client", d.get("our_client", "")), ("Marketing Name", d['marketing_name']),
         ("Class of Business", d['class_of_business']),
         ("Period of Insurance", f"{d['period_from']} — {d['period_to']}"),
         ("Insured Name", d['insured_name']), ("Occupation", d['occupation']),
@@ -375,6 +559,35 @@ def pdf_bytes(d):
         ("Allocation Total (%)", d['allocation_total_pct']),
         ("Confirmed by", f"{d['uw_confirmed_by']} at {d['uw_confirmed_at']}" if d['uw_confirmed_at'] else "Pending"),
     ])
+    if d.get('additional_form') == 'Yes':
+        pairs_section("06 / Additional Form", [
+            ("Date", d.get('additional_date', '')), ("PS No", d.get('additional_ps_no', '')),
+            ("Name of Intermediary", d.get('additional_intermediary', '')),
+            ("Name of Insured", d.get('additional_insured', '')),
+            ("Coverage", d.get('additional_coverage', '')),
+            ("Total of Additional Fee", f"{d.get('currency','IDR')} {d.get('additional_fee','')}"),
+            ("Approval Status", d.get('additional_status', '')),
+        ])
+        story.append(Paragraph("SIGNATURE REGISTER", styles["SD_H"]))
+        sig_fields = [
+            ("Sales Support", 'additional_sales_signed_by', 'additional_sales_signed_at'),
+            ("Marketing Manager", 'additional_marketing_signed_by', 'additional_marketing_signed_at'),
+            ("Marketing Director", 'additional_marketing_director_signed_by', 'additional_marketing_director_signed_at'),
+            ("Technical Director", 'additional_technical_signed_by', 'additional_technical_signed_at'),
+            ("President Director", 'additional_president_signed_by', 'additional_president_signed_at'),
+        ]
+        cells = []
+        for label, by, at in sig_fields:
+            signed = f"Signed by {d.get(by)} at {d.get(at)}" if d.get(by) else "Awaiting signature"
+            cells.append([P(label, 'SD_Label'), P(signed, 'SD_Value')])
+        sig_table = Table(cells, colWidths=[155, avail - 155])
+        sig_table.setStyle(TableStyle([
+            ('BOX', (0,0),(-1,-1),.6,border),
+            ('LINEBELOW', (0,0),(-1,-2),.35,border),
+            ('BACKGROUND',(0,0),(0,-1),soft),
+            ('TOPPADDING',(0,0),(-1,-1),9),('BOTTOMPADDING',(0,0),(-1,-1),9),
+        ]))
+        story.append(sig_table)
     story.append(Spacer(1,14))
     story.append(P("Internal workflow record. This document does not constitute a policy, cover note, or binder.", "SD_Muted"))
 
@@ -414,6 +627,71 @@ def cities(province_id):
         return []
 
 
+def signature_card(label, signed_by="", signed_at=""):
+    sign = f"Signed by {html.escape(str(signed_by))}<br><span>{html.escape(str(signed_at))}</span>" if signed_by else "Awaiting signature"
+    st.markdown(f"<div class='signature-card'><div class='signature-role'>{html.escape(label)}</div>"
+                f"<div class='signature-value'>{sign}</div></div>", unsafe_allow_html=True)
+
+
+def additional_form_preview(d):
+    st.markdown("#### Additional Form")
+    st.caption(f"Approval status: {d.get('additional_status') or 'Pending Marketing'}")
+    a, b, c = st.columns(3)
+    a.text_input("Date", value=d.get("additional_date", ""), disabled=True, key="view_add_date")
+    b.text_input("PS No", value=d.get("additional_ps_no", ""), disabled=True, key="view_add_ps")
+    c.text_input("Total Additional Fee", value=d.get("additional_fee", ""), disabled=True, key="view_add_fee")
+    left, right = st.columns(2)
+    with left:
+        st.text_input("Name of Intermediary", value=d.get("additional_intermediary", ""), disabled=True)
+        st.text_input("Coverage", value=d.get("additional_coverage", ""), disabled=True)
+    with right:
+        st.text_input("Name of Insured", value=d.get("additional_insured", ""), disabled=True)
+    sigs = [
+        ("Sales Support", "additional_sales_signed_by", "additional_sales_signed_at"),
+        ("Marketing Manager", "additional_marketing_signed_by", "additional_marketing_signed_at"),
+        ("Marketing Director", "additional_marketing_director_signed_by", "additional_marketing_director_signed_at"),
+        ("Technical Director", "additional_technical_signed_by", "additional_technical_signed_at"),
+        ("President Director", "additional_president_signed_by", "additional_president_signed_at"),
+    ]
+    for i in range(0, len(sigs), 3):
+        columns = st.columns(3)
+        for col, (label, by, at) in zip(columns, sigs[i:i+3]):
+            with col:
+                signature_card(label, d.get(by, ""), d.get(at, ""))
+
+
+def chat_panel(d, role, user):
+    with st.expander("Ticket Discussion & Revision Requests", expanded=False):
+        messages = load_chat(d["ticket_id"])
+        if messages:
+            for m in messages[-40:]:
+                label = f"{m['role']} · {m['username']} · {m['timestamp']}"
+                if m.get('type') == 'Revision Request':
+                    label += f" · Revision requested from {m['target_role']}"
+                st.markdown(f"**{html.escape(label)}**")
+                st.write(m.get("message", ""))
+                st.divider()
+        else:
+            st.caption("No messages yet.")
+        with st.form(f"chat_{d['ticket_id']}", clear_on_submit=True):
+            msg = st.text_area("Message", placeholder="Write a message; mention colleagues with @gilang.k or @hadi...", height=85)
+            recipients = st.multiselect(
+                "Mention people (in-app notification)",
+                options=[email for email in ROLES if email != user],
+                format_func=lambda email: f"{ROLES[email]} · {email}",
+                help="Selected colleagues and @mentioned usernames receive a dashboard notification.",
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                kind = st.selectbox("Message type", ["Discussion", "Revision Request"])
+            with c2:
+                target = st.selectbox("For team", ["All Teams", "Sales Support", "Marketing", "Reinsurance", "Underwriting", "Technical Director"])
+            send = st.form_submit_button("Send Message", type="primary")
+        if send and msg.strip():
+            add_message(d['ticket_id'], user, role, kind, target, msg, recipients)
+            st.rerun()
+
+
 def new_ticket(user):
     st.subheader("Create New Acceptance Ticket")
     st.caption("Complete quotation details • Fields marked * are mandatory")
@@ -421,7 +699,12 @@ def new_ticket(user):
     lcol, rcol = st.columns(2, gap="large")
     with lcol:
         src = st.selectbox("Source of Business *", SOURCES)
-        marketing_name = st.text_input("Marketing Name *") if src in SOURCES[2:] else ""
+        if src != "Direct Business":
+            our_client = st.text_input("Our Client *")
+            marketing_name = st.text_input("Marketing Name *")
+        else:
+            our_client = ""
+            marketing_name = ""
     with rcol:
         country_names = sorted({c.name for c in pycountry.countries})
         country = st.selectbox("Country *", country_names, index=country_names.index("Indonesia"))
@@ -441,6 +724,7 @@ def new_ticket(user):
             province = st.text_input("Province / State *")
         with location_r:
             city = st.text_input("City *")
+    additional = st.checkbox("Make an Additional Form", key="additional_form_toggle")
     with st.form("new_ticket", clear_on_submit=False):
         st.markdown("#### Business & Policy Details")
         c1, c2 = st.columns(2, gap="large")
@@ -456,6 +740,18 @@ def new_ticket(user):
             period_to = st.date_input("Period of Insurance — Up to *")
             brokerage = st.number_input("Brokerage / RIC", min_value=0.0, step=100000.0, format="%.2f")
             to_reins = st.checkbox("Proses Tiket ke Reasuransi")
+        additional_inputs = {}
+        if additional:
+            st.markdown("#### Additional Form Details")
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                additional_inputs["additional_date"] = str(st.date_input("Date", value=datetime.now(TZ).date()))
+                additional_inputs["additional_ps_no"] = st.text_input("PS No")
+                additional_inputs["additional_intermediary"] = st.text_input("Name of Intermediary")
+            with ac2:
+                additional_inputs["additional_insured"] = st.text_input("Name of Insured", value=insured)
+                additional_inputs["additional_coverage"] = st.text_input("Coverage")
+                additional_inputs["additional_fee"] = f"{st.number_input('Total of Additional Fee', min_value=0.0, format='%.2f'):.2f}"
         actuarial_insight()
         st.markdown("#### Marketing Information")
         marketing_info = st.text_area("Information & Explanation *", height=125, label_visibility="collapsed", placeholder="Provide marketing background, client context and quotation notes...")
@@ -463,8 +759,12 @@ def new_ticket(user):
         submit = st.form_submit_button("Process Ticket →", type="primary", use_container_width=True)
     if submit:
         errors = []
-        if src in SOURCES[2:] and not marketing_name.strip():
+        if src != "Direct Business" and not marketing_name.strip():
             errors.append("Marketing Name wajib diisi untuk source yang dipilih.")
+        if src != "Direct Business" and not our_client.strip():
+            errors.append("Our Client wajib diisi untuk non-direct business.")
+        if additional and any(not str(additional_inputs.get(k, "")).strip() for k in ["additional_ps_no", "additional_intermediary", "additional_insured", "additional_coverage"]):
+            errors.append("Lengkapi seluruh informasi Additional Form.")
         if period_to < period_from:
             errors.append("Tanggal Up to harus sama atau sesudah From.")
         if not insured.strip() or not occupation.strip() or not detail.strip() or not marketing_info.strip() or not province.strip() or not city.strip():
@@ -484,6 +784,11 @@ def new_ticket(user):
         d.update({
             "ticket_id": tid, "status": "Pending Marketing", "created_at": stamp,
             "created_by": user, "source_of_business": src, "marketing_name": marketing_name,
+            "our_client": our_client,
+            "additional_form": "Yes" if additional else "No",
+            "additional_status": "Pending Marketing" if additional else "",
+            "additional_sales_signed_by": user if additional else "",
+            "additional_sales_signed_at": stamp if additional else "",
             "class_of_business": class_of_business, "period_from": str(period_from), "period_to": str(period_to),
             "insured_name": insured, "occupation": occupation,
             "country": country, "province": province,
@@ -493,6 +798,7 @@ def new_ticket(user):
             "marketing_information": marketing_info, "sales_confirmed_at": stamp,
             "updated_at": stamp, "updated_by": user
         })
+        d.update(additional_inputs)
         append_ticket(d)
         log_action(tid, "CREATE", user, "", "Pending Marketing", "Ticket created by Sales Support")
         st.success(f"Ticket #{tid} berhasil dibuat. Status: Pending Marketing")
@@ -500,18 +806,151 @@ def new_ticket(user):
         st.rerun()
 
 
+def edit_owned_fields(d, role, user):
+    """Section-owner edits, independent of current workflow state; audit every update."""
+    if role == "Sales Support" and d["created_by"] == user:
+        with st.expander("Edit Sales Support Information", expanded=False):
+            with st.form(f"sales_edit_{d['ticket_id']}"):
+                a, b = st.columns(2)
+                with a:
+                    src = st.selectbox("Source of Business", SOURCES, index=SOURCES.index(d['source_of_business']) if d['source_of_business'] in SOURCES else 0)
+                    client = st.text_input("Our Client", d.get("our_client", "")) if src != "Direct Business" else ""
+                    mkt = st.text_input("Marketing Name", d.get("marketing_name", "")) if src != "Direct Business" else ""
+                    cob = st.selectbox("Class", CLASSES, index=CLASSES.index(d['class_of_business']) if d['class_of_business'] in CLASSES else 0)
+                    insured = st.text_input("Insured Name", d['insured_name'])
+                    occupation = st.text_input("Occupation", d['occupation'])
+                    currency = st.selectbox("Currency", CURRENCIES, index=CURRENCIES.index(d['currency']) if d['currency'] in CURRENCIES else 0)
+                    tsi = st.number_input("Total Sum Insured", value=float(d.get('total_sum_insured') or 0), min_value=0.0, format="%.2f")
+                with b:
+                    date_from = st.date_input("Period From", value=datetime.fromisoformat(d['period_from']).date())
+                    date_to = st.date_input("Period To", value=datetime.fromisoformat(d['period_to']).date())
+                    country = st.text_input("Country", d['country'])
+                    province = st.text_input("Province", d['province'])
+                    city = st.text_input("City", d['city'])
+                    detail = st.text_input("Risk Location Detail", d['risk_detail'])
+                    ric = st.number_input("Brokerage / RIC", value=float(d.get('brokerage_ric') or 0), min_value=0.0, format="%.2f")
+                    reins = st.checkbox("Proses Tiket ke Reasuransi", value=d.get('process_reinsurance') == 'Yes', disabled=bool(d.get('marketing_reviewed_at')))
+                # Lock reinsurance routing after marketing has decided the next stage.
+                extra = {}
+                if d.get("additional_form") == "Yes":
+                    st.markdown("**Additional Form Details**")
+                    ex1, ex2 = st.columns(2)
+                    with ex1:
+                        extra['additional_ps_no'] = st.text_input("PS No", d.get('additional_ps_no', ''))
+                        extra['additional_intermediary'] = st.text_input("Name of Intermediary", d.get('additional_intermediary', ''))
+                        extra['additional_date'] = str(st.date_input("Additional Date", value=datetime.fromisoformat(d['additional_date']).date() if d.get('additional_date') else datetime.now(TZ).date()))
+                    with ex2:
+                        extra['additional_insured'] = st.text_input("Name of Insured", d.get('additional_insured', ''))
+                        extra['additional_coverage'] = st.text_input("Coverage", d.get('additional_coverage', ''))
+                        extra['additional_fee'] = f"{st.number_input('Total Additional Fee', value=float(d.get('additional_fee') or 0), min_value=0.0, format='%.2f'):.2f}"
+                save = st.form_submit_button("Save Changes")
+            if save:
+                if not all([insured.strip(), occupation.strip(), detail.strip(), city.strip(), province.strip(), country.strip()]) or tsi <= 0 or date_to < date_from:
+                    st.error("Periksa isian wajib, nilai TSI, dan periode asuransi.")
+                elif src != "Direct Business" and not (client.strip() and mkt.strip()):
+                    st.error("Our Client dan Marketing Name wajib diisi untuk non-direct business.")
+                else:
+                    changes = dict(source_of_business=src, our_client=client, marketing_name=mkt,
+                        class_of_business=cob, insured_name=insured, occupation=occupation,
+                        currency=currency, total_sum_insured=f"{tsi:.2f}", period_from=str(date_from),
+                        period_to=str(date_to), country=country, province=province, city=city,
+                        risk_detail=detail, brokerage_ric=f"{ric:.2f}")
+                    if not d.get('marketing_reviewed_at'):
+                        changes['process_reinsurance'] = 'Yes' if reins else 'No'
+                    changes.update(extra)
+                    audit_edit(d['ticket_id'], user, role, changes)
+                    st.rerun()
+    elif role == "Marketing":
+        with st.expander("Edit Marketing Information", expanded=False):
+            with st.form(f"marketing_edit_{d['ticket_id']}"):
+                info = st.text_area("Marketing Information", value=d.get('marketing_information', ''), height=120)
+                save = st.form_submit_button("Save Changes")
+            if save and info.strip():
+                audit_edit(d['ticket_id'], user, role, {'marketing_information': info})
+                st.rerun()
+    elif role == "Reinsurance" and d.get('process_reinsurance') == 'Yes' and d.get('marketing_reviewed_at'):
+        with st.expander("Edit Reinsurance Information", expanded=False):
+            with st.form(f"reins_edit_{d['ticket_id']}"):
+                info = st.text_area("Reinsurance Information", value=d.get('reinsurance_information', ''), height=120)
+                save = st.form_submit_button("Save Changes")
+            if save:
+                audit_edit(d['ticket_id'], user, role, {'reinsurance_information': info})
+                st.rerun()
+    elif role == "Underwriting" and d.get('uw_confirmed_by'):
+        with st.expander("Edit Underwriting Information", expanded=False):
+            with st.form(f"uw_edit_{d['ticket_id']}"):
+                a, b, c = st.columns(3)
+                with a:
+                    decision = st.selectbox("Decision", FINAL_STATUSES, index=FINAL_STATUSES.index(d['uw_status']) if d['uw_status'] in FINAL_STATUSES else 0)
+                with b:
+                    leader = st.selectbox("Our Role", ["Leader", "Member"], index=0 if d['our_role'] != "Member" else 1)
+                with c:
+                    share = st.number_input("Our Share (%)", value=float(d.get('our_share_pct') or 100), min_value=0.0, max_value=100.0)
+                rec = st.text_area("Underwriting Recommendation", value=d.get('underwriting_recommendation', ''))
+                c1, c2, c3, c4 = st.columns(4)
+                values = [float(d.get(k) or 0) for k in ['own_retention_pct','qs_pct','spl_pct','facultative_pct']]
+                own = c1.number_input("Own Retention", value=values[0], min_value=0.0, max_value=100.0)
+                qs = c2.number_input("Treaty QS", value=values[1], min_value=0.0, max_value=100.0)
+                spl = c3.number_input("Treaty SPL", value=values[2], min_value=0.0, max_value=100.0)
+                fac = c4.number_input("Facultative", value=values[3], min_value=0.0, max_value=100.0)
+                st.caption(f"Allocation Total: {own+qs+spl+fac:.2f}%")
+                save = st.form_submit_button("Save Changes")
+            if save:
+                if abs(own+qs+spl+fac-100)>0.001 or not rec.strip():
+                    st.error("Risk Allocation harus 100% dan recommendation harus diisi.")
+                else:
+                    audit_edit(d['ticket_id'], user, role, {'status':decision,'uw_status':decision,
+                        'our_role':leader,'our_share_pct':f'{share:.2f}', 'underwriting_recommendation':rec,
+                        'own_retention_pct':f'{own:.2f}', 'qs_pct':f'{qs:.2f}',
+                        'spl_pct':f'{spl:.2f}', 'facultative_pct':f'{fac:.2f}',
+                        'allocation_total_pct':f'{own+qs+spl+fac:.2f}'})
+                    st.rerun()
+
+
+def additional_approval(d, role, user):
+    if d.get('additional_form') != 'Yes':
+        return
+    status = d.get('additional_status', '')
+    if role == 'Marketing' and status == 'Pending Marketing':
+        if st.button("Sign Additional Form & Proceed to Technical Director", type="primary", key=f"add_marketing_{d['ticket_id']}"):
+            current = fresh_ticket(d['ticket_id'])
+            if current and current.get('additional_status') == 'Pending Marketing':
+                stamp = now()
+                patch_ticket(d['ticket_id'], {'additional_marketing_signed_by':user,
+                    'additional_marketing_signed_at':stamp,
+                    'additional_status':'Pending Technical Director', 'updated_at':stamp, 'updated_by':user})
+                log_action(d['ticket_id'], 'ADDITIONAL_MARKETING_SIGN', user, status, 'Pending Technical Director')
+                st.rerun()
+    elif role == 'Technical Director' and status == 'Pending Technical Director':
+        if st.button("Sign Additional Form & Confirm", type="primary", key=f"add_technical_{d['ticket_id']}"):
+            current = fresh_ticket(d['ticket_id'])
+            if current and current.get('additional_status') == 'Pending Technical Director':
+                stamp = now()
+                patch_ticket(d['ticket_id'], {'additional_technical_signed_by':user,
+                    'additional_technical_signed_at':stamp, 'additional_status':'Completed',
+                    'updated_at':stamp, 'updated_by':user})
+                log_action(d['ticket_id'], 'ADDITIONAL_TECHNICAL_SIGN', user, status, 'Completed')
+                st.rerun()
+
+
 def detail_ticket(d, role, user):
     st.button("← Back to Dashboard", on_click=page_back)
     st.subheader(f"Ticket #{d['ticket_id']} — {d['insured_name']}")
     st.caption("SuperDashboard  ·  #BePaperless")
     st.info(f"Current Status: {d['status']}")
+    if d.get("source_of_business") != "Direct Business":
+        st.caption(f"Our Client: {d.get('our_client', '—')} · Marketing Name: {d.get('marketing_name', '—')}")
+    if d.get("additional_form") == "Yes":
+        additional_form_preview(d)
+    chat_panel(d, role, user)
+    edit_owned_fields(d, role, user)
+    additional_approval(d, role, user)
     actuarial_insight()
     if st.toggle("Show PDF preview / download", value=False, key=f"pdf_{d['ticket_id']}"):
         pdf = pdf_bytes(d)
         st.download_button("download pdf", pdf, file_name=f"SuperDashboard_Ticket_{d['ticket_id']}.pdf", mime="application/pdf", type="primary")
         st.pdf(pdf, height=560)
-    if role == "Admin":
-        st.caption("Admin: read-only overview (no approval overrides in this MVP).")
+    if role in ("Admin", "Technical Director", "Marketing Director", "President Director"):
         return
     if role == "Marketing" and d["status"] == "Pending Marketing":
         st.divider()
@@ -530,7 +969,8 @@ def detail_ticket(d, role, user):
             next_status = "Pending Reinsurance" if current["process_reinsurance"] == "Yes" else "Pending UW"
             current.update({"marketing_information": info, "marketing_reviewed_by": user, "marketing_reviewed_at": now(),
                             "status": next_status, "updated_at": now(), "updated_by": user})
-            update_ticket(current)
+            patch_ticket(d["ticket_id"], {k: current[k] for k in
+                ["marketing_information", "marketing_reviewed_by", "marketing_reviewed_at", "status", "updated_at", "updated_by"]})
             log_action(d["ticket_id"], "MARKETING_APPROVE", user, "Pending Marketing", next_status)
             st.success(f"Diteruskan ke {next_status}")
             st.rerun()
@@ -550,7 +990,8 @@ def detail_ticket(d, role, user):
                 return
             current.update({"reinsurance_information": info, "reinsurance_reviewed_by": user,
                             "reinsurance_reviewed_at": now(), "status": "Pending UW", "updated_at": now(), "updated_by": user})
-            update_ticket(current)
+            patch_ticket(d["ticket_id"], {k: current[k] for k in
+                ["reinsurance_information", "reinsurance_reviewed_by", "reinsurance_reviewed_at", "status", "updated_at", "updated_by"]})
             log_action(d["ticket_id"], "REINSURANCE_PROCEED", user, "Pending Reinsurance", "Pending UW")
             st.success("Diteruskan ke Underwriting")
             st.rerun()
@@ -595,7 +1036,10 @@ def detail_ticket(d, role, user):
                 "facultative_pct": f"{fac:.2f}", "allocation_total_pct": f"{total:.2f}",
                 "uw_confirmed_by": user, "uw_confirmed_at": now(), "updated_at": now(), "updated_by": user
             })
-            update_ticket(current)
+            patch_ticket(d["ticket_id"], {k: current[k] for k in
+                ["uw_status", "status", "our_role", "our_share_pct", "underwriting_recommendation",
+                 "own_retention_pct", "qs_pct", "spl_pct", "facultative_pct", "allocation_total_pct",
+                 "uw_confirmed_by", "uw_confirmed_at", "updated_at", "updated_by"]})
             log_action(d["ticket_id"], "UW_FINAL", user, "Pending UW", decision, f"Allocation {total:.2f}%")
             st.success(f"Tiket selesai: {decision}")
             st.rerun()
@@ -650,6 +1094,9 @@ def main():
         if not record:
             st.error("Ticket tidak ditemukan.")
             page_back()
+        if role == "Technical Director" and record.get("additional_form") != "Yes":
+            st.error("Akses tidak diizinkan.")
+            page_back()
         if role == "Reinsurance" and record["process_reinsurance"] != "Yes":
             st.error("Akses tidak diizinkan.")
             page_back()
@@ -668,6 +1115,7 @@ def main():
     st.title("SuperDashboard")
     st.markdown('<div class="tagline">#BePaperless</div>', unsafe_allow_html=True)
     st.caption(f"Logged in: {user} · {role} · Asia/Jakarta timezone")
+    notification_panel(user, all_tickets)
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Tickets", len(all_tickets))
     c2.metric("Pending", sum(x["status"].startswith("Pending") for x in all_tickets))
@@ -681,6 +1129,8 @@ def main():
         with tabs[1]:
             new_ticket(user)
     elif role == "Marketing":
+        st.subheader("Additional Forms — Awaiting Signature")
+        show_table([x for x in all_tickets if x.get('additional_status') == 'Pending Marketing'], "add_marketing_pending")
         st.subheader("1. Pending Marketing")
         show_table([x for x in all_tickets if x["status"] == "Pending Marketing"], "marketing_pending")
         st.subheader("2. Reviewed Tickets / Progress")
@@ -695,6 +1145,14 @@ def main():
         show_table([x for x in all_tickets if x["status"] == "Pending UW"], "uw_pending")
         st.subheader("2. Finished Tickets")
         show_table([x for x in all_tickets if x["status"] in FINAL_STATUSES], "uw_done")
+    elif role == "Technical Director":
+        st.subheader("Additional Forms — Pending Technical Director")
+        show_table([x for x in all_tickets if x.get('additional_status') == 'Pending Technical Director'], "technical_pending")
+        st.subheader("Additional Forms — Signed")
+        show_table([x for x in all_tickets if x.get('additional_technical_signed_at')], "technical_done")
+    elif role in ("Marketing Director", "President Director"):
+        st.subheader("Additional Forms — Overview")
+        show_table([x for x in all_tickets if x.get('additional_form') == 'Yes'], "director_overview")
     else:
         st.subheader("All Tickets — Admin Overview")
         show_table(all_tickets, "admin_all")
@@ -705,6 +1163,8 @@ def main():
         st.info("Full audit trail is stored in the AuditLog worksheet in Google Sheets.")
     if st.button("Refresh", key="refresh_data"):
         invalidate_tickets()
+        load_mentions.clear()
+        load_chat.clear()
         st.rerun()
 
 
